@@ -1,7 +1,7 @@
 ---
-title: "Movement Replication: UDP Batching and Prediction"
+title: "Movement Replication via UDP Batching and Prediction"
 sidebarTitle: "Movement Replication"
-description: "How the server receives C_MoveReq over UDP, applies server-authoritative movement physics, batches snapshots into MoveBatchNotify datagrams, and supports client-side prediction reconciliation."
+description: "How the server receives C_MoveReq over UDP, applies authoritative movement physics, batches snapshots into MoveBatchNotify datagrams at 100 ms."
 ---
 
 Player movement uses a hybrid transport model. Clients send `C_MoveReq` over UDP—connectionless, low-latency, drop-tolerant—and the server responds with authoritative position updates batched into `S_MoveBatchNotify` datagrams delivered over the same UDP socket. TCP carries only the reliable subset of game events (combat acknowledgements, inventory operations, chat). This split keeps the TCP stream free from the high-frequency movement traffic that would otherwise head-of-line block more important packets.

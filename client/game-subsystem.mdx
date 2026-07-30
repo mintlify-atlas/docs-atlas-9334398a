@@ -15,23 +15,23 @@ class MMOCLIENT1_API UGameClientSubsystem : public UGameInstanceSubsystem
     GENERATED_BODY()
 public:
     // --- Delegates (all BlueprintAssignable) ---
-    FGameEnterResult              OnEnterGameResult;
-    FRemoteCharacterSpawned       OnRemoteCharacterSpawned;
-    FRemoteCharacterMoved         OnRemoteCharacterMoved;
-    FRemoteCharacterDespawned     OnRemoteCharacterDespawned;
-    FChatMessageReceived          OnChatMessageReceived;
-    FAttackAckReceived            OnAttackAckReceived;
-    FRemoteCharacterAttackStarted OnRemoteCharacterAttackStarted;
-    FMonsterSpawned               OnMonsterSpawned;
-    FMonsterDespawned             OnMonsterDespawned;
-    FMonsterMoved                 OnMonsterMoved;
-    FMonsterAttackStarted         OnMonsterAttackStarted;
-    FMonsterServerDebugChanged    OnMonsterServerDebugChanged;  // debug
-    FMyHealthChanged              OnMyHealthChanged;
-    FMonsterHealthChanged         OnMonsterHealthChanged;
-    FServerCombatDebugReceived    OnServerCombatDebugReceived;  // debug
+    FGameEnterResult                  OnEnterGameResult;
+    FRemoteCharacterSpawned           OnRemoteCharacterSpawned;
+    FRemoteCharacterMoved             OnRemoteCharacterMoved;
+    FRemoteCharacterDespawned         OnRemoteCharacterDespawned;
+    FChatMessageReceived              OnChatMessageReceived;
+    FAttackAckReceived                OnAttackAckReceived;
+    FRemoteCharacterAttackStarted     OnRemoteCharacterAttackStarted;
+    FMonsterSpawned                   OnMonsterSpawned;
+    FMonsterDespawned                 OnMonsterDespawned;
+    FMonsterMoved                     OnMonsterMoved;
+    FMonsterAttackStarted             OnMonsterAttackStarted;
+    FMonsterServerDebugChanged        OnMonsterServerDebugChanged;       // debug
+    FMyHealthChanged                  OnMyHealthChanged;
+    FMonsterHealthChanged             OnMonsterHealthChanged;
+    FServerCombatDebugReceived        OnServerCombatDebugReceived;       // debug
     FServerMonsterCombatDebugReceived OnServerMonsterCombatDebugReceived; // debug
-    FMonsterRangedShotReceived    OnMonsterRangedShotReceived;
+    FMonsterRangedShotReceived        OnMonsterRangedShotReceived;
 
     // --- Connection ---
     bool ConnectAndEnterGame(const FString& Host, int32 Port,
@@ -256,10 +256,30 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
     FAttackAckReceived,
     bool, bSuccess, int32, AttackSequence, int32, ComboStep, const FString&, Message);
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+    FRemoteCharacterAttackStarted,
+    int64, CharacterId, int32, ComboStep, int64, ServerTimeMs);
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_SevenParams(
     FMonsterSpawned,
     int64, MonsterId, int32, TemplateId, FVector, Location,
     float, Yaw, int32, CurrentHp, int32, MaxHp, bool, bExisting);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FMonsterDespawned, int64, MonsterId);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
+    FMonsterMoved,
+    int64, MonsterId, FVector, Location, FVector, Velocity, float, Yaw, int64, ServerTimeMs);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
+    FMonsterAttackStarted,
+    int64, MonsterId, int64, TargetCharacterId, int32, AttackSequence, int32, AttackType, int64, ServerTimeMs);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_SixParams(
+    FMonsterServerDebugChanged,
+    int64, MonsterId, float, DetectionRadius, float, RangedAttackRadius,
+    float, MeleeAttackRadius, float, CapsuleRadius, int32, AiState);
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
     FMyHealthChanged,
@@ -268,6 +288,15 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
     FMonsterHealthChanged,
     int64, MonsterId, int32, CurrentHp, int32, MaxHp, int32, DeltaHp, bool, bDead);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FServerCombatDebugReceived, const FServerCombatDebugEvent&, DebugEvent);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FServerMonsterCombatDebugReceived, const FServerMonsterCombatDebugEvent&, DebugEvent);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FMonsterRangedShotReceived, const FMonsterRangedShotEvent&, ShotEvent);
 ```
 
 `AMCPlayerController` binds to all of these in `BeginPlay` and unbinds in `EndPlay`.

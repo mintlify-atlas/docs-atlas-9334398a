@@ -95,9 +95,9 @@ bool SendChatMessage(const FString& Message);
     {
         Super::NativeConstruct();
         // ...
-        if (UGameClientSubsystem* GCS = GetGameClientSubsystem())
+        if (UGameClientSubsystem* GameClientSubsystem = GetGameClientSubsystem())
         {
-            GCS->OnChatMessageReceived.AddUniqueDynamic(
+            GameClientSubsystem->OnChatMessageReceived.AddUniqueDynamic(
                 this, &UChatWidget::HandleChatMessageReceived);
         }
     }
@@ -141,8 +141,8 @@ bool SendChatMessage(const FString& Message);
         }
 
         bool bSent = false;
-        if (UGameClientSubsystem* GCS = GetGameClientSubsystem())
-            bSent = GCS->SendChatMessage(Message);
+        if (UGameClientSubsystem* GameClientSubsystem = GetGameClientSubsystem())
+            bSent = GameClientSubsystem->SendChatMessage(Message);
 
         CloseChat();
         return bSent;
@@ -159,8 +159,8 @@ bool SendChatMessage(const FString& Message);
     void UChatWidget::NativeDestruct()
     {
         UnbindChatInput();
-        if (UGameClientSubsystem* GCS = GetGameClientSubsystem())
-            GCS->OnChatMessageReceived.RemoveDynamic(
+        if (UGameClientSubsystem* GameClientSubsystem = GetGameClientSubsystem())
+            GameClientSubsystem->OnChatMessageReceived.RemoveDynamic(
                 this, &UChatWidget::HandleChatMessageReceived);
         Super::NativeDestruct();
     }

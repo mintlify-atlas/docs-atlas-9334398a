@@ -1,7 +1,7 @@
 ---
 title: "UE5 IOCP MMO Server: Real-Time Multiplayer Backend"
 sidebarTitle: "Introduction"
-description: "A production-ready Windows IOCP C++ game server paired with an ASP.NET Core auth service, MariaDB, Redis, and a UE5.4 client — built for large-scale MMO development."
+description: "Windows IOCP C++ game server with ASP.NET Core auth, MariaDB, Redis, and a UE5.4 client — a complete reference for large-scale MMO development."
 ---
 
 The UE5 IOCP MMO Server is an end-to-end multiplayer backend designed for game developers building large-scale MMO experiences with Unreal Engine 5.4. It combines a high-performance C++ game server built on Windows I/O Completion Ports (IOCP) with a lightweight ASP.NET Core 8 authentication service, MariaDB 11 for persistent data, Redis 7 for token management, and Protocol Buffers for compact binary messaging. Whether you are prototyping a new MMO or studying production-grade server architecture, this project provides a complete, runnable reference implementation covering the full flow from player registration through real-time gameplay.
@@ -56,6 +56,7 @@ The following compile-time constants from `Common/Config.h` and `Common/Types.h`
 | `HeartbeatIntervalSeconds` | `5 s` | How often the server sends a heartbeat ping |
 | `HeartbeatTimeoutSeconds` | `15 s` | Idle time before a session is forcibly disconnected |
 | `MAX_SESSIONS` | `10 000` | Hard cap on simultaneous connected sessions |
+| `WORKER_THREAD_COUNT` | `4` | Number of IOCP worker threads dequeuing completion events |
 
 <Note>
   The game server uses `WinSock2`, `MSWSock`, and the Windows IOCP API (`CreateIoCompletionPort`, `AcceptEx`, `DisconnectEx`). It **cannot** be compiled or run on Linux or macOS without a significant rewrite. All server components are intended to be deployed on Windows Server or run locally on Windows 10/11.

@@ -1,7 +1,7 @@
 ---
-title: "IOCP Async Networking in the C++ Game Server"
+title: "IOCP Async Networking in the C++ Game Server Layer"
 sidebarTitle: "IOCP Network"
-description: "How the C++ MMO server uses Windows IOCP with AcceptEx, worker threads, TCP sessions, and a UDP socket on the same port for low-latency movement replication."
+description: "How the C++ MMO server uses Windows IOCP with AcceptEx, four worker threads, TCP sessions, and a shared UDP socket for low-latency movement."
 ---
 
 The server's network layer is built directly on Windows I/O Completion Ports (IOCP), the highest-throughput async I/O model available on Win32. Rather than one thread per connection, IOCP posts completed I/O events—accepts, receives, sends, disconnects, and timer firings—onto a shared kernel queue. A fixed pool of `WORKER_THREAD_COUNT = 4` worker threads calls `GetQueuedCompletionStatus` in a tight loop, pulling completions off that queue and dispatching them by their `IoType`. This design scales to thousands of concurrent TCP sessions without thread explosion and keeps latency predictable under load.

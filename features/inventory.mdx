@@ -249,20 +249,38 @@ CREATE TABLE IF NOT EXISTS inventory_operations (
 
 ### `item_templates`
 
+Created by `003_item_templates.sql`:
+
 ```sql
 CREATE TABLE IF NOT EXISTS item_templates (
   template_id  INT UNSIGNED NOT NULL PRIMARY KEY,
   name         VARCHAR(100) NOT NULL,
   max_stack    INT UNSIGNED NOT NULL DEFAULT 1,
   usable       TINYINT(1)   NOT NULL DEFAULT 0,
-  effect_type  TINYINT UNSIGNED NOT NULL DEFAULT 0,
-  effect_value INT          NOT NULL DEFAULT 0,
   CONSTRAINT chk_item_templates_max_stack CHECK (max_stack > 0)
 );
 
--- Example: Test Potion (template_id 1001) heals 30 HP
-INSERT INTO item_templates (template_id, name, max_stack, usable, effect_type, effect_value)
-VALUES (1001, 'Test Potion', 99, 1, 1, 30);
+INSERT INTO item_templates (template_id, name, max_stack, usable)
+VALUES (1001, 'Test Potion', 99, 1)
+ON DUPLICATE KEY UPDATE
+  name = VALUES(name),
+  max_stack = VALUES(max_stack),
+  usable = VALUES(usable);
+```
+
+`004_item_effects.sql` then adds the effect columns and sets values for existing templates:
+
+```sql
+ALTER TABLE item_templates
+  ADD COLUMN IF NOT EXISTS effect_type  TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS effect_value INT              NOT NULL DEFAULT 0;
+
+-- Test Potion (template_id 1001) heals 30 HP
+UPDATE item_templates
+SET usable       = 1,
+    effect_type  = 1,
+    effect_value = 30
+WHERE template_id = 1001;
 ```
 
 <Tip>

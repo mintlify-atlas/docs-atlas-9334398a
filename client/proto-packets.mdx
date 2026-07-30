@@ -99,7 +99,7 @@ message C_MoveReq {
 
 ### C_ChatReq — `0x0221`
 
-Sends a global chat message over TCP. Maximum length is 512 characters (enforced by the server).
+Sends a global chat message over TCP. Maximum length is 512 UTF-8 bytes (enforced client-side before sending).
 
 ```protobuf
 message C_ChatReq {

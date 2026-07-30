@@ -1,7 +1,7 @@
 ---
-title: "Server-Side Game Simulation Tick Loop"
+title: "Game Simulation Tick Loop: Phases and Command Queue"
 sidebarTitle: "Game Simulation"
-description: "How the single-threaded GameSimulation loop runs at 30 Hz, drains a lock-free command queue each tick, executes six ordered phases, and exposes latency histograms for Grafana."
+description: "How the single-threaded GameSimulation loop ticks every 33 ms, drains a command queue, executes six ordered phases, and tracks latency histograms."
 ---
 
 The server's authoritative game state lives inside a single-threaded simulation loop. All network threads—IOCP workers receiving UDP movement inputs, TCP packet handlers processing attacks and inventory operations—submit work by enqueuing `Command` lambdas into a thread-safe queue. The simulation thread wakes on each 33 ms tick, drains the command queue, then advances game state through six ordered phases. Because only the simulation thread ever mutates `GameWorld`, no additional locks are needed on the game objects themselves.
@@ -44,7 +44,7 @@ std::deque<TimedCommand> commands_;   // protected by commandMutex_
 
 | Config constant                       | Value   | Meaning                                         |
 |---------------------------------------|---------|-------------------------------------------------|
-| `MaxGameSimulationCommandQueueSize`   | 65,536  | Commands dropped (metric: `commandsDrained`) beyond this |
+| `MaxGameSimulationCommandQueueSize`   | 65,536  | `Enqueue()` returns `false` (command dropped) when queue exceeds this depth |
 | `GameSimulationTickIntervalMs`        | 33      | Target tick period (≈ 30 Hz)                    |
 
 `Enqueue()` acquires `commandMutex_`, pushes the `TimedCommand`, and signals `wakeCondition_` to unblock the simulation thread if it is sleeping. `EnqueueAndWait()` additionally blocks the calling thread on a second condition variable until the command lambda returns, which is useful for synchronous queries from external threads.

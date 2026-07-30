@@ -1,14 +1,14 @@
 ---
-title: "System Architecture of the UE5 IOCP MMO Server"
+title: "UE5 IOCP MMO Server: Full System Architecture Guide"
 sidebarTitle: "Architecture"
-description: "A deep-dive into the three-tier design: ASP.NET Core AuthServer, C++ IOCP GameServer, and UE5.4 client — their responsibilities, data stores, and the full connection flow."
+description: "Three-tier breakdown: ASP.NET Core AuthServer, C++ IOCP GameServer, and UE5.4 client — responsibilities, data stores, and end-to-end connection flow."
 ---
 
 The UE5 IOCP MMO Server follows a three-tier architecture that cleanly separates authentication concerns from real-time gameplay concerns. An ASP.NET Core 8 **AuthServer** owns all pre-game flows — registration, login, server listing, and server selection — and issues cryptographically random tokens that are stored in Redis. The C++ IOCP **GameServer** owns session state and all real-time gameplay, and only processes a session after it has presented a valid enter token. The **UE5 client** keeps these two flows in separate subsystems (`AuthClientSubsystem` for HTTP and `GameClientSubsystem` for TCP/UDP), ensuring the UI layer never mixes lobby and gameplay logic.
 
 ## System Diagram
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Unreal Engine 5.4 Client                 │
 │                                                                 │
@@ -154,7 +154,7 @@ The server ticks a `GameSimulation` at `GameSimulationTickIntervalMs = 33 ms` (~
 
 The client is split into two Subsystems following the rule stated in `AGENTS.md`:
 
-```
+```text
 AuthClientSubsystem  =  HTTP login / register / server-list / server-select
 GameClientSubsystem  =  TCP GameServer connection / gameplay packets
 ```

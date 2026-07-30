@@ -1,7 +1,7 @@
 ---
-title: "Configure the ASP.NET Core AuthServer"
+title: "Configure the ASP.NET Core AuthServer (appsettings.json)"
 sidebarTitle: "AuthServer Config"
-description: "Reference for every appsettings.json section, token lifecycle, and input validation rules for the ASP.NET Core AuthServer."
+description: "Reference for every appsettings.json section, token lifecycle, duplicate-login policies, and input validation rules for the ASP.NET Core AuthServer."
 ---
 
 The AuthServer is an ASP.NET Core Minimal API application responsible for account registration, login, and issuing short-lived enter tokens that the C++ GameServer validates before admitting a player. All runtime configuration is read from `appsettings.json` (or environment-variable overrides following the standard ASP.NET Core configuration hierarchy), so no recompilation is needed to change database endpoints, token expiry times, or login policies.

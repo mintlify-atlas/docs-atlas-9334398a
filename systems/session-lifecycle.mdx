@@ -1,7 +1,7 @@
 ---
-title: "Session Lifecycle: Connect, Auth, and Disconnect"
+title: "Session Lifecycle: Connect, Authenticate, Disconnect"
 sidebarTitle: "Session Lifecycle"
-description: "Complete lifecycle of a game session from pool acquisition through TCP connection, authentication, heartbeat monitoring, job queuing, and graceful teardown with pool reuse."
+description: "Lifecycle of a game session from pool acquisition through TCP connect, authentication, heartbeat monitoring, job queuing, and graceful teardown."
 ---
 
 Every player connection is represented by a `Session` object that travels through a strictly ordered set of states. `Session` objects are never constructed or destroyed during normal operation—they live in a fixed-size `SessionPool` and are recycled through `PrepareForReuse()` when a connection closes. This design avoids dynamic allocation on the hot path and gives each session a stable pool slot index (used by the AoI visibility bitset).

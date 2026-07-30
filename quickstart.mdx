@@ -1,7 +1,7 @@
 ---
-title: "Get the UE5 IOCP MMO Server Running Locally"
+title: "Quickstart: Run the Full UE5 IOCP MMO Server Locally"
 sidebarTitle: "Quickstart"
-description: "Step-by-step guide to spinning up MariaDB, Redis, Prometheus, Grafana, the ASP.NET Core AuthServer, the C++ IOCP GameServer, and the UE5.4 client on a single Windows machine."
+description: "Spin up MariaDB, Redis, Prometheus, Grafana, the ASP.NET Core AuthServer, the C++ IOCP GameServer, and the UE5.4 client on one Windows machine."
 ---
 
 This guide walks you through every step needed to run all components of the UE5 IOCP MMO Server on a single Windows development machine — from cloning the repository and standing up the Docker infrastructure through launching the C++ game server and connecting with the Unreal Engine 5.4 client. The whole stack (excluding the Unreal Editor compile) should be up in under ten minutes.
@@ -59,7 +59,7 @@ Before you start, make sure all of the following are installed and working:
 
     Edit `.env` with your chosen passwords:
 
-    ```bash
+    ```ini
     MARIADB_ROOT_PASSWORD=replace_with_a_strong_local_password
     MARIADB_PASSWORD=replace_with_a_strong_local_password
     GRAFANA_ADMIN_USER=admin

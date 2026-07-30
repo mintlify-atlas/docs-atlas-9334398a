@@ -29,6 +29,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Auth")
     void SetAuthServerBaseUrl(const FString& InBaseUrl);
 
+    UFUNCTION(BlueprintPure, Category = "Auth")
+    FString GetAuthServerBaseUrl() const;
+
     UFUNCTION(BlueprintCallable, Category = "Auth")
     bool Register(const FString& Account, const FString& Password, const FString& Nickname);
 
@@ -48,8 +51,8 @@ public:
     void ClearLocalSession();
 
     // BlueprintPure getters: IsLoggedIn, GetAccessToken, GetEnterToken,
-    // GetSelectedCharacterId, GetSelectedGameServerIp,
-    // GetSelectedGameServerPort, GetCachedServerList
+    // GetSelectedCharacterId, GetSelectedGameServerIp, GetSelectedGameServerPort,
+    // GetCachedServerList, GetAuthServerBaseUrl
 };
 ```
 

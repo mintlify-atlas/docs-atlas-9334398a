@@ -1,7 +1,7 @@
 ---
-title: "Configure the C++ IOCP GameServer"
+title: "Configure the C++ IOCP GameServer (Config.h Reference)"
 sidebarTitle: "GameServer Config"
-description: "Set up Database.ini, Redis.ini, and understand every compile-time constant in Config.h before running the C++ IOCP GameServer."
+description: "Set up Database.ini and Redis.ini, then reference every compile-time constant in Config.h before building and running the C++ IOCP GameServer."
 ---
 
 The C++ IOCP GameServer reads two runtime configuration files — `Database.ini` and `Redis.ini` — before opening its listen socket. Everything else that shapes server behavior is baked into `Common/Config.h` as `constexpr` values and takes effect only after a recompilation. This page documents both layers so you can tune the server for your environment without hunting through header files.
@@ -64,54 +64,115 @@ These constants are evaluated at compile time. Modifying `Config.h` without reco
 |---|---|---|
 | `ListenPort` | `7777` | TCP port the server accepts gameplay connections on |
 | `UdpListenPort` | `7777` | UDP port used for low-latency movement datagrams |
+| `Backlog` | `2147483647` (`0x7fffffff`) | `listen()` backlog passed to the OS |
 | `BufferSize` | `4096` | Default I/O buffer size per operation (bytes) |
-| `MaxPacketSize` | `16384` | Maximum allowed size of a single received packet (16 KiB) |
-| `RecvBufferSize` | `131072` | Per-session receive ring-buffer size (128 KiB) |
-| `SendBufferSize` | `65536` | Per-session send buffer size (64 KiB) |
+| `MaxPacketSize` | `16384` | Maximum allowed size of a single received packet (16 × 1024 bytes) |
+| `MaxEchoPayloadSize` | `4096` | Maximum payload size for echo packets (4 × 1024 bytes) |
+| `RecvBufferSize` | `131072` | Per-session receive ring-buffer size (128 × 1024 bytes) |
+| `SendBufferSize` | `65536` | Per-session send buffer size (64 × 1024 bytes) |
 | `InitialSessionPoolSize` | `1024` | Number of session objects pre-allocated in the pool at startup |
+| `InitialSendPacketBufferPoolSize` | `1024` | Number of send-packet buffer objects pre-allocated in the pool |
+| `InitialRecvBufferBlockPoolSize` | `1024` | Number of receive-buffer block objects pre-allocated in the pool |
 | `WORKER_THREAD_COUNT` | `4` | Number of IOCP worker threads servicing completion packets |
+| `MAX_CONCURRENT_THREADS` | `0` | IOCP concurrency hint passed to `CreateIoCompletionPort`; `0` means use the CPU core count |
 
-### Session limits
+### Input validation
+
+| Constant | Value | Description |
+|---|---|---|
+| `MinLoginAccountLength` | `4` | Minimum number of characters in an account name |
+| `MaxLoginAccountLength` | `64` | Maximum number of characters in an account name |
+| `MinLoginPasswordLength` | `8` | Minimum number of characters in a password |
+| `MaxLoginPasswordLength` | `128` | Maximum number of characters in a password |
+| `MaxChatMessageLength` | `512` | Maximum character length of a single chat message payload |
+
+### Session and threading
 
 | Constant | Value | Description |
 |---|---|---|
 | `MaxPacketsPerSecond` | `100` | Per-session inbound packet rate limit; excess packets are dropped |
-| `MaxChatMessageLength` | `512` | Maximum character length of a single chat message payload |
+| `MaxSessionJobQueueSize` | `1024` | Maximum number of jobs queued per session before backpressure is applied |
+| `SessionJobWorkerCount` | `4` | Number of worker threads processing per-session job queues |
 | `HeartbeatIntervalSeconds` | `5` | How often the server expects a heartbeat from each client (seconds) |
 | `HeartbeatTimeoutSeconds` | `15` | Seconds without a heartbeat before a session is forcibly closed |
-| `MAX_SESSIONS` | `10000` | Hard upper bound on simultaneous connected sessions |
+
+### Inventory persistence
+
+| Constant | Value | Description |
+|---|---|---|
+| `InventoryDbWorkerCount` | `2` | Number of worker threads dedicated to inventory database writes |
+| `MaxInventoryDbQueueSize` | `4096` | Maximum number of inventory write operations queued before backpressure |
+
+### Character-state persistence
+
+| Constant | Value | Description |
+|---|---|---|
+| `CharacterStateSaveBucketIntervalSeconds` | `1.0` | Duration of each save bucket in seconds; total save cycle = `BucketCount × BucketInterval` (10 s) |
+| `CharacterStateSaveBucketCount` | `10` | Number of time-slice buckets that spread dirty-character flushes across the save interval |
+| `CharacterStateDbBatchSize` | `100` | Maximum number of character rows written to the database in a single batch flush |
+| `CharacterStateDbRetryCount` | `2` | Number of times a failed character-state batch write is retried before the error is logged and dropped |
 
 ### Game simulation
 
 | Constant | Value | Description |
 |---|---|---|
 | `GameSimulationTickIntervalMs` | `33` | Simulation tick period in milliseconds (~30 Hz) |
-| `MaxGameSimulationCommandQueueSize` | `65536` | Maximum number of pending simulation commands buffered before backpressure is applied |
+| `MaxGameSimulationCommandQueueSize` | `65536` | Maximum number of pending simulation commands buffered (64 × 1024) before backpressure is applied |
 
-### Movement
+### Movement and AoI
 
 | Constant | Value | Description |
 |---|---|---|
+| `MaxMovementDeltaSeconds` | `0.05` | Maximum time-delta accepted for a single movement step; larger deltas are clamped |
 | `MovementAoiViewDistance` | `3000.0` | Area-of-Interest radius for broadcasting movement updates (Unreal units) |
+| `MovementAoiCellSize` | `3000.0` | AoI spatial-hash cell size; equals `MovementAoiViewDistance` |
 | `MovementNotifyIntervalMs` | `100` | Minimum interval between movement-notification dispatches per entity (ms) |
+| `MovementNotifyDatagramBytes` | `1200` | Maximum UDP datagram size used for movement replication packets (bytes) |
+| `MaxMovementReplicationPendingSnapshots` | `65536` | Maximum number of pending movement snapshots queued for replication (64 × 1024) |
 | `MovementMaxWalkSpeed` | `500.0` | Maximum authoritative walk speed used in server-side movement validation (Unreal units/s) |
 | `MovementMaxAcceleration` | `800.0` | Maximum authoritative acceleration (Unreal units/s²) |
+| `MovementBrakingDecelerationWalking` | `750.0` | Authoritative braking deceleration while walking (Unreal units/s²) |
+| `MovementGroundFriction` | `5.0` | Ground-friction coefficient used in server-side movement integration |
+| `MovementBrakingFrictionFactor` | `1.0` | Multiplier applied to friction during braking |
+| `MovementMinAnalogWalkSpeed` | `150.0` | Minimum speed threshold for analog (stick) movement (Unreal units/s) |
+| `MovementInputDeadZone` | `0.01` | Input magnitude below this threshold is treated as zero |
+| `MovementInputTimeoutMs` | `250` | Milliseconds after which a movement input is considered stale and discarded |
 
-### Persistence
+### Monster AI
 
 | Constant | Value | Description |
 |---|---|---|
-| `CharacterStateSaveBucketCount` | `10` | Number of time-slice buckets that spread dirty-character flushes across the save interval |
-| `CharacterStateSaveBucketIntervalSeconds` | `1.0` | Duration of each save bucket in seconds; total save cycle = `BucketCount × BucketInterval` (10 s) |
-| `CharacterStateDbBatchSize` | `100` | Maximum number of character rows written to the database in a single batch flush |
+| `MonsterAoiViewDistance` | `3000.0` | AoI radius for monster aggro and visibility; equals `MovementAoiViewDistance` |
+| `MonsterAoiRefreshIntervalSeconds` | `0.2` | How often the monster AoI grid is re-queried (seconds) |
+| `MonsterRespawnDelaySeconds` | `30` | Seconds after death before a monster re-spawns |
+
+### Combat and load testing
+
+| Constant | Value | Description |
+|---|---|---|
+| `EnableCombatDebugPackets` | `true` | Send additional debug packets during combat for client-side diagnostics |
+| `EnableLoadTestSpawnSpread` | `true` | Distribute load-test entities across a grid instead of spawning them at a single point |
+| `LoadTestSpawnSpacing` | `4000.0` | Grid spacing between load-test entities (Unreal units; equals `MovementAoiViewDistance + 1000`) |
+| `LoadTestSpawnGridWidth` | `10` | Number of columns in the load-test spawn grid |
+
+### Logging
+
+| Constant | Value | Description |
+|---|---|---|
+| `LogAsyncQueueSize` | `32768` | Capacity of the async log queue in entries (32 × 1024) |
+| `LogWriterThreadCount` | `1` | Number of background threads consuming the async log queue |
+| `LogMaxFileSizeBytes` | `52428800` | Maximum size of a single log file before rotation (50 × 1024 × 1024 bytes) |
+| `LogMaxFiles` | `10` | Maximum number of rotated log files retained on disk |
 
 ### Metrics
 
 | Constant | Value | Description |
 |---|---|---|
 | `EnablePerfMetrics` | `true` | Master switch for the performance metrics subsystem |
+| `EnablePerfConsoleLog` | `false` | Print performance metrics to stdout on each interval tick |
 | `EnablePerfCsvLog` | `true` | Write rolling performance metrics to `Logs/perf_metrics.csv` |
 | `PerfLogIntervalSeconds` | `5` | How often a metrics snapshot is recorded (seconds) |
+| `PerfCsvLogPath` | `"Logs/perf_metrics.csv"` | Relative path of the CSV metrics output file |
 | `EnablePrometheusEndpoint` | `true` | Expose a Prometheus `/metrics` HTTP endpoint |
 | `PrometheusHttpPort` | `9108` | Port the embedded Prometheus HTTP listener binds to |
 

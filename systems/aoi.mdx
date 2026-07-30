@@ -1,7 +1,7 @@
 ---
 title: "Area of Interest: Cell Grid for Visibility Culling"
 sidebarTitle: "AoI System"
-description: "How the server uses a spatial cell grid to limit movement, spawn, and monster notifications to nearby players only, including player visibility tracking and monster observer maps."
+description: "How the server uses a spatial cell grid to limit movement and monster notifications to nearby players, with visibility tracking and observer maps."
 ---
 
 Without an Area of Interest (AoI) system, every player position update would need to be broadcast to every connected session—an O(n²) problem that collapses server throughput as player count grows. The AoI system divides the world into a grid of square cells and maintains per-cell session lists so that movement notifications, spawn events, and monster broadcasts are sent only to players whose cells overlap with the source entity's neighbourhood. A nine-cell neighbourhood search (3×3 grid centred on the source) is sufficient because each cell is exactly one `MovementAoiViewDistance` wide.

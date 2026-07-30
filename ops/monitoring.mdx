@@ -82,7 +82,9 @@ The `/metrics` response is derived from `NetworkMetrics::Snapshot`. The fields a
 |-------|-------------|
 | `recvBytes` | Cumulative bytes received over TCP |
 | `recvPackets` | Cumulative TCP packets received |
+| `recvPayloadCopyBytes` | Cumulative bytes copied when reading TCP payloads |
 | `sendPackets` | Cumulative TCP packets sent |
+| `sendPayloadCopyBytes` | Cumulative bytes copied when building TCP send payloads |
 | `sendCalls` | Number of `WSASend` calls made |
 | `scatterGatherSendCalls` | `WSASend` calls that used scatter-gather buffers |
 
@@ -121,9 +123,25 @@ The `/metrics` response is derived from `NetworkMetrics::Snapshot`. The fields a
 | Field | Description |
 |-------|-------------|
 | `movementReplicationPublished` | Position snapshots published to the replication buffer |
+| `movementReplicationReplaced` | Snapshots overwritten in the buffer by a newer position before dispatch |
+| `movementReplicationDropped` | Snapshots dropped from the replication buffer |
 | `movementReplicationDispatched` | Snapshots dispatched to clients in a replication cycle |
-| `movementReplicationPending` | Snapshots currently waiting to be dispatched |
+| `movementReplicationCycles` | Total replication cycles completed |
 | `movementReplicationCycleTotalMicros` | Cumulative microseconds spent in replication cycles |
+| `movementReplicationCycleMaxMicros` | Slowest single replication cycle in microseconds |
+| `movementReplicationPending` | Snapshots currently waiting to be dispatched |
+| `movementReplicationPendingMax` | Peak pending snapshot count observed |
+| `movementReplicationWorkSamples` | Number of replication work-phase samples recorded |
+| `movementReplicationGatherTotalMicros` | Cumulative microseconds spent gathering snapshots |
+| `movementReplicationGatherMaxMicros` | Slowest single gather phase in microseconds |
+| `movementReplicationSendTotalMicros` | Cumulative microseconds spent sending replication datagrams |
+| `movementReplicationSendMaxMicros` | Slowest single send phase in microseconds |
+| `movementReplicationAoiTotalMicros` | Cumulative microseconds spent on AoI queries during replication |
+| `movementReplicationAoiMaxMicros` | Slowest single AoI phase in microseconds |
+| `movementReplicationVisibilityTotalMicros` | Cumulative microseconds spent on visibility checks |
+| `movementReplicationVisibilityMaxMicros` | Slowest single visibility phase in microseconds |
+| `movementReplicationBatchBuildTotalMicros` | Cumulative microseconds building batch notify datagrams |
+| `movementReplicationBatchBuildMaxMicros` | Slowest single batch-build phase in microseconds |
 
 </Accordion>
 
@@ -135,7 +153,34 @@ The `/metrics` response is derived from `NetworkMetrics::Snapshot`. The fields a
 | `gameSimulationOverBudgetTicks` | Ticks that exceeded the 33 ms budget |
 | `gameSimulationTickTotalMicros` | Cumulative tick wall-clock time in microseconds |
 | `gameSimulationTickMaxMicros` | Slowest single tick in microseconds |
-| `missedTicks` | Ticks skipped because the previous tick ran too long |
+| `gameSimulationRuntime.missedTicks` | Ticks skipped because the previous tick ran too long |
+| `gameSimulationRuntime.commandQueueDepth` | Command queue depth at the last runtime sample |
+| `gameSimulationRuntime.commandQueueDepthMax` | Peak command queue depth observed |
+| `gameSimulationRuntime.commandsDrained` | Commands drained in the last simulation drain pass |
+| `gameSimulationRuntime.commandWaitSamples` | Number of command-wait latency samples recorded |
+| `gameSimulationRuntime.commandWaitTotalMicros` | Cumulative command wait time in microseconds |
+| `gameSimulationRuntime.commandWaitP95Micros` | 95th-percentile command wait latency in microseconds |
+| `gameSimulationRuntime.commandWaitP99Micros` | 99th-percentile command wait latency in microseconds |
+| `gameSimulationRuntime.commandWaitMaxMicros` | Maximum command wait latency in microseconds |
+| `gameSimulationRuntime.drainBatches` | Number of drain batches executed |
+| `gameSimulationRuntime.drainTotalMicros` | Cumulative drain execution time in microseconds |
+| `gameSimulationRuntime.drainMaxMicros` | Slowest single drain batch in microseconds |
+| `gameSimulationRuntime.tickTimingSamples` | Number of tick-lateness timing samples |
+| `gameSimulationRuntime.tickLatenessTotalMicros` | Cumulative tick lateness in microseconds |
+| `gameSimulationRuntime.tickLatenessMaxMicros` | Maximum tick lateness in microseconds |
+| `gameSimulationPhaseSamples[*]` | Per-phase sample counts (CharacterStateSave, PlayerMovement, PlayerCombat, MonsterCombat, MonsterSimulation, MonsterNotifications) |
+| `gameSimulationPhaseTotalMicros[*]` | Per-phase cumulative time in microseconds |
+| `gameSimulationPhaseMaxMicros[*]` | Per-phase peak time in microseconds |
+
+</Accordion>
+
+<Accordion title="Active movers">
+
+| Field | Description |
+|-------|-------------|
+| `activeMoverSamples` | Number of active-mover count samples taken |
+| `activeMoverTotal` | Sum of active-mover counts across all samples |
+| `activeMoverMax` | Peak active-mover count observed |
 
 </Accordion>
 
@@ -181,7 +226,7 @@ constexpr const char* PerfCsvLogPath   = "Logs/perf_metrics.csv";
 When `EnablePerfCsvLog` is `true` a new row is appended every 5 seconds. This file is the primary input for the [PerformanceReport tool](/ops/performance).
 
 <Tip>
-  Watch `gameSimulationOverBudgetTicks` and `missedTicks` as your primary at-a-glance health signals. A single non-zero `missedTicks` reading means the simulation loop fell a full 33 ms behind — investigate `gameSimulationTickMaxMicros` and per-phase timings first before tuning thread counts.
+  Watch `gameSimulationOverBudgetTicks` and `gameSimulationRuntime.missedTicks` as your primary at-a-glance health signals. A single non-zero `missedTicks` reading means the simulation loop fell a full 33 ms behind — investigate `gameSimulationTickMaxMicros` and per-phase timings first before tuning thread counts.
 </Tip>
 
 <Note>

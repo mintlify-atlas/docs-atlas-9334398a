@@ -1,7 +1,7 @@
 ---
-title: "Binary Packet Protocol: IDs, Header, and Protobuf"
+title: "Binary Packet Protocol: IDs, Headers, and Protobuf"
 sidebarTitle: "Packet Protocol"
-description: "Full reference for the 4-byte binary header, every packet ID by range, Protobuf message schemas, the MoveBatchNotify binary layout, and the S_ErrorRes error code table."
+description: "Reference for the 4-byte binary header, every packet ID by range, Protobuf message schemas, MoveBatchNotify binary layout, and error codes."
 ---
 
 Every TCP frame exchanged between client and server begins with a 4-byte fixed header followed by a variable-length payload encoded as a Protocol Buffers message. UDP datagrams for movement share the same header layout but use a custom packed binary payload for `MoveBatchNotify` rather than Protobuf, so the format is maximally compact inside a single datagram. `PacketHandlerRegistry` maps the 16-bit `packetId` directly to a handler via a flat 65,536-entry array, making dispatch O(1) with no hash computation.

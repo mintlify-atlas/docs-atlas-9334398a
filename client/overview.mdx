@@ -1,0 +1,123 @@
+---
+title: "UE5 Client Architecture and Module Structure"
+sidebarTitle: "Overview"
+description: "A complete walkthrough of the MMOClient1 Unreal Engine 5.4 project: module dependencies, subsystem split, key gameplay classes, UI widgets, and the standalone WebUI login page."
+---
+
+The **MMOClient1** project is an Unreal Engine 5.4 game client built around a strict separation of concerns. HTTP-based authentication flows are isolated in `UAuthClientSubsystem`, while real-time gameplay communication over TCP and UDP lives in `UGameClientSubsystem`. Player controllers, UI widgets, character actors, and supporting subsystems each own a clearly bounded slice of responsibility, making the codebase straightforward to extend without cross-contaminating the auth layer and the gameplay layer.
+
+## Module structure
+
+The `MMOClient1` module is configured in `MMOClient1.Build.cs`. Key aspects of the build setup include:
+
+- **Engine modules**: `Core`, `CoreUObject`, `Engine`, `InputCore`
+- **UI modules**: `UMG`, `Slate`, `SlateCore`
+- **Networking modules**: `Sockets`, `Networking`, `HTTP`
+- **Serialization modules**: `Json`, `JsonUtilities`
+- **Additional modules**: `Niagara` (VFX), `MoviePlayer` (loading screens), `WebBrowserWidget` (embedded HTML login page)
+- **Third-party**: `libprotobuf` and `abseil_dll` are linked from a vcpkg installation at `C:\vcpkg\installed\x64-windows` and staged alongside the executable at runtime. The `PROTOBUF_USE_DLLS=1` definition enables DLL-mode protobuf. Exception handling is enabled via `bEnableExceptions = true`.
+
+```csharp
+PublicDependencyModuleNames.AddRange(new string[]
+{
+    "Core", "CoreUObject", "Engine", "InputCore",
+    "Niagara", "Slate", "SlateCore", "MoviePlayer",
+    "Sockets", "Networking", "UMG", "WebBrowserWidget",
+    "HTTP", "Json", "JsonUtilities"
+});
+```
+
+The `WebUI/...` directory is staged as `NonUFS` so the standalone HTML login page ships with the packaged build.
+
+## Subsystem split
+
+The client's network layer is divided into two `UGameInstanceSubsystem` classes, both accessible from any game code via `GetGameInstance()->GetSubsystem<T>()`.
+
+| Subsystem | Responsibility |
+|---|---|
+| `UAuthClientSubsystem` | HTTP login, register, server list, server select, token storage |
+| `UGameClientSubsystem` | TCP game server connection, UDP movement channel, all gameplay packet send/receive |
+
+This mirrors the server-side split: the ASP.NET Core AuthServer owns all account/token logic, and the IOCP GameServer owns only post-authentication gameplay. The client follows the same boundary — `AuthClientSubsystem` never touches a game socket, and `GameClientSubsystem` never makes an HTTP call.
+
+## Key classes
+
+### `ALoginPlayerController`
+
+A `APlayerController` subclass that drives the pre-game login flow. It creates and owns the `ULoginWidget`, binds to `UAuthClientSubsystem`'s `OnSelectServerResult` delegate, and — once a server is selected — calls `UGameClientSubsystem::ConnectAndEnterGame` with the enter token and character ID returned by the auth server. After the game enters successfully, `ALoginPlayerController` opens the gameplay level.
+
+### `AMCPlayerController`
+
+The in-game player controller. It owns the per-frame move-input loop, the combo-attack state machine, and all server-driven correction logic. It reads `UGameClientSubsystem`'s latest server location each tick and smoothly interpolates the controlled pawn toward the server-authoritative position. It also manages the `UChatWidget`, `UInventoryWidget`, and `UGameExitMenuWidget` UMG overlays, routing input to whichever panel is currently open.
+
+### `AMonsterCharacter`
+
+An `ACharacter` subclass that represents a server-spawned monster entity in the game world. It carries a `UHealthComponent` and a world-space `UWidgetComponent` for the health bar. On each server move notify, it interpolates toward the server target location using configurable `LocationInterpSpeed` and hard-snap thresholds. It also plays melee and ranged attack montages driven by server attack notifications, and Niagara tracer and muzzle-flash effects for ranged shots.
+
+### `UHealthComponent`
+
+A `UActorComponent` that tracks `CurrentHp` and `MaxHp` for any actor (player characters, monsters). It exposes `InitializeHealth`, `ApplyServerHealth`, and `GetHealthRatio()`, and broadcasts the `OnHealthChanged` dynamic multicast delegate whenever HP changes — used by `AMonsterCharacter` to refresh the health bar widget.
+
+### `UInventorySubsystem`
+
+A `UGameInstanceSubsystem` that holds the client-side inventory state received from the server. It stores the current `Revision`, `Capacity`, and a flat `TArray<FInventoryItemState>` of items (each with `ItemInstanceId`, `TemplateId`, `Quantity`, `SlotIndex`, `Durability`). `UGameClientSubsystem` calls `ApplySnapshot` when an `S_InventorySnapshot` or `S_InventoryOperationResult` packet arrives, which then broadcasts `OnInventorySnapshotChanged` for the UI to refresh.
+
+### `UItemRegistrySubsystem`
+
+A `UGameInstanceSubsystem` that loads all `UItemDataAsset` definitions via the Asset Manager at startup, building a `TMap<int32, UItemDataAsset*>` keyed by `TemplateId`. UI code calls `FindItem(TemplateId)` to retrieve display names and icons. UI-bundle soft references are streamed in on demand via `RequestUiAssets(TemplateId)`, avoiding loading every icon into memory upfront.
+
+### `UItemDataAsset`
+
+A `UPrimaryDataAsset` subclass representing a single item template. Fields include:
+
+- `TemplateId` — matches the `template_id` used in inventory packets
+- `DisplayName` and `Description` — localized `FText` values shown in the inventory UI
+- `Icon` — `TSoftObjectPtr<UTexture2D>` loaded in the UI bundle
+- `WorldStaticMesh` / `WorldSkeletalMesh` — soft references for world-dropped item visuals
+
+## UI widgets
+
+<CardGroup cols={2}>
+  <Card title="LoginWidget" icon="user">
+    Hosts an embedded `UWebBrowser` that loads the HTML/JS login page. Handles `unreal://` scheme URL callbacks from the page's JavaScript to trigger `UAuthClientSubsystem` register and login calls. Also manages the post-login server list panel and `ULoginServerEntryWidget` rows.
+  </Card>
+  <Card title="GameMainWidget" icon="gamepad">
+    The primary HUD overlay displayed during gameplay. Embeds the `UChatWidget` and owns a `UProgressBar` plus `UTextBlock` for the player's health display. Calls `SetPlayerHealth` to update the bar when `UGameClientSubsystem` broadcasts an HP change.
+  </Card>
+  <Card title="ChatWidget" icon="message-square">
+    Displays a scrollable `UScrollBox` chat log and a text-input field. Opens on Enter, closes on commit or Escape. Binds to `UGameClientSubsystem::OnChatMessageReceived` and calls `SendChatMessage` on submit. Supports up to `MaxVisibleMessages` (default 100) lines.
+  </Card>
+  <Card title="InventoryWidget" icon="box">
+    Programmatically builds a `UUniformGridPanel` of `UInventorySlotWidget` cells at construction time. Refreshes slot visuals when `UInventorySubsystem::OnInventorySnapshotChanged` fires. Routes left-click and right-click slot input to `UGameClientSubsystem::SendInventoryMove` or `SendInventoryUse`.
+  </Card>
+  <Card title="InventorySlotWidget" icon="square">
+    A single inventory cell. Displays a `UImage` icon, a `UTextBlock` for quantity, and a border that highlights selection state and pending-operation state. Owned and refreshed by `UInventoryWidget`.
+  </Card>
+  <Card title="MonsterHealthBarWidget" icon="heart">
+    World-space UMG widget attached to `AMonsterCharacter` via a `UWidgetComponent` offset above the monster's head. Refreshed by `AMonsterCharacter::RefreshHealthWidget` whenever `OnHealthChanged` fires.
+  </Card>
+  <Card title="MCLoadingScreen" icon="loader">
+    A movie-player loading screen widget displayed during level transitions (login level → gameplay level). Managed by the `MoviePlayer` module to overlay during seamless travel.
+  </Card>
+  <Card title="LoginServerEntryWidget" icon="server">
+    A single row in the server list panel inside `ULoginWidget`. Displays server name, current/max users, and maintenance status. Calls `ULoginWidget::SelectServer` when clicked.
+  </Card>
+  <Card title="GameExitMenuWidget" icon="log-out">
+    An escape-menu overlay managed by `AMCPlayerController`. Provides **Quit Game** and **Return to Login** actions. The controller calls `SetExitMenuOpen(true/false)` to show or hide it.
+  </Card>
+</CardGroup>
+
+## WebUI login page
+
+`MMOClient1/WebUI/Login/login.html` is a standalone HTML5 page served to the `UWebBrowser` widget inside `ULoginWidget`. It presents two views — a **Login** view and a **Register** view — and communicates results back to Unreal by setting `window.location.hash` to a `uegame://` scheme URL (e.g. `uegame://login?email=…&password=…&requestId=…`). `ULoginWidget` watches for URL changes and parses the scheme to call the appropriate `UAuthClientSubsystem` method.
+
+The JavaScript exposes two callback entry points that Unreal can call via `UWebBrowser::ExecuteJavascript`:
+
+- `setLoginResult(success, message)` — re-enables the login button and shows a coloured status message
+- `setRegisterResult(success, message)` — does the same for the registration form
+
+The page is staged as `NonUFS` so it is available in packaged builds without being cooked into the asset graph.
+
+<Note>
+This project requires **Unreal Engine 5.4** (`"EngineAssociation": "5.4"` in `MMOClient1.uproject`). The `AnimationWarping`, `PoseSearch`, `AnimationLocomotionLibrary`, `MotionWarping`, and `Chooser` plugins are all enabled and are part of UE5.4's animation feature set. Opening the project with a different engine version will produce plugin compatibility errors.
+</Note>

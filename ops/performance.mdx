@@ -1,0 +1,176 @@
+---
+title: "Performance Tuning and Baseline Comparison"
+sidebarTitle: "Performance"
+description: "Use the CSV metrics log and PerformanceReport tool to compare runs against a baseline JSON and generate HTML reports with pass/warn/fail checks."
+---
+
+The GameServer writes a continuous CSV performance log that captures every `NetworkMetrics::Snapshot` field at a configurable interval. The **PerformanceReport** tool in `ServerSolution/Tools/PerformanceReport/` correlates that CSV with a load-test result JSON produced by [MoveLoadTester](/ops/load-testing) and generates an HTML report plus a `performance-summary.json` file. An optional baseline JSON enables regression detection across builds or configuration changes.
+
+## CSV metrics log
+
+The CSV log is enabled by default:
+
+```cpp
+constexpr bool EnablePerfCsvLog       = true;
+constexpr int  PerfLogIntervalSeconds = 5;
+constexpr const char* PerfCsvLogPath  = "Logs/perf_metrics.csv";
+```
+
+A new row is appended every `PerfLogIntervalSeconds` seconds for as long as the server is running. The columns correspond directly to the fields in `NetworkMetrics::Snapshot` — connection counts, TCP/UDP counters, movement command and replication counters, simulation tick timings, process memory and CPU, and the log-drop counter. Opening the CSV in the PerformanceReport tool filters it to the time window of the load test being analyzed.
+
+## PerformanceReport tool
+
+The tool lives at `ServerSolution/Tools/PerformanceReport/` and is a .NET console application.
+
+### Inputs and outputs
+
+| Flag | Description |
+|------|-------------|
+| `--server-csv <path>` | Path to `perf_metrics.csv` **or** the `Logs/` directory (picks the most recent `perf_metrics*.csv` automatically) |
+| `--load-json <path>` | JSON output file from MoveLoadTester (repeat for multiple runs) |
+| `--series-csv <path>` | Per-second time-series CSV from MoveLoadTester `--series-output`; must be supplied once per `--load-json` if used |
+| `--baseline <path>` | Optional baseline JSON for regression comparison |
+| `--capture-baseline <path>` | If provided, writes a new baseline JSON derived from the current run |
+| `--output <path>` | HTML report output path (default: `performance-report.html`) |
+| `--summary-output <path>` | JSON summary output path (default: `performance-summary.json`) |
+
+### Example invocation
+
+```bash
+dotnet run --project ServerSolution/Tools/PerformanceReport -- \
+  --server-csv Logs/perf_metrics.csv \
+  --load-json Performance/run-001.json \
+  --baseline Performance/baseline.example.json \
+  --output Performance/report.html \
+  --summary-output Performance/summary.json
+```
+
+The tool prints the overall `pass` / `warning` / `fail` status and the paths of the generated files:
+
+```
+[Report] status=Pass runs=1
+[Report] html=C:\...\Performance\report.html
+[Report] summary=C:\...\Performance\summary.json
+```
+
+### Analyzed fields
+
+The analyzer computes per-run statistics from the server CSV samples that fall within the load-test measurement window (warm-up excluded). Key computed metrics include:
+
+| Metric | Description |
+|--------|-------------|
+| `commandWaitP95Micros` / `commandWaitP99Micros` | Percentile wait time for simulation commands from enqueue to drain |
+| `missedTicks` | Count of ticks skipped over the measurement window |
+| `simOverBudgetDelta` | Increase in over-budget ticks during the run |
+| `movementReplicationPending` | Snapshot backlog in the replication buffer |
+| `cpuP95Percent` | 95th-percentile process CPU across all server samples |
+| `simTickAvgP95Ms` | 95th-percentile of per-tick average duration |
+| `privateMemoryGrowthPercent` | Growth of process private bytes from first to last sample |
+
+## baseline.example.json
+
+`ServerSolution/Performance/baseline.example.json` is a ready-to-use template that ships with the repository. Its structure:
+
+```json
+{
+  "profileName": "example-30hz",
+  "thresholds": {
+    "simTpsWarningBelow": 29.5,
+    "simTpsFailureBelow": 28.0,
+    "simTickAvgWarningMs": 16.5,
+    "simTickAvgFailureMs": 26.4,
+    "simTickMaxWarningMs": 33.0,
+    "simTickMaxFailureMs": 66.0,
+    "commandWaitP99WarningMs": 40.0,
+    "commandWaitP99FailureMs": 66.0,
+    "tickLatenessWarningMs": 5.0,
+    "tickLatenessFailureMs": 15.0,
+    "cpuP95WarningPercent": 60.0,
+    "cpuP95FailurePercent": 80.0,
+    "privateMemoryGrowthWarningPercent": 5.0,
+    "privateMemoryGrowthFailurePercent": 10.0,
+    "moveRttP95WarningMs": 100.0,
+    "moveRttP95FailureMs": 150.0,
+    "moveRttP99WarningMs": 150.0,
+    "moveRttP99FailureMs": 250.0,
+    "echoRttP95WarningMs": 2.0,
+    "echoRttP95FailureMs": 5.0,
+    "echoRttP99WarningMs": 5.0,
+    "echoRttP99FailureMs": 10.0,
+    "echoResponseRateWarningPercent": 99.9,
+    "echoResponseRateFailurePercent": 99.0,
+    "regressionWarningPercent": 20.0,
+    "regressionFailurePercent": 50.0,
+    "missedTicksWarningCount": 1.0,
+    "missedTicksFailureCount": 2.0,
+    "movementReplicationTargetHz": 10.0,
+    "movementReplicationDispatchWarningPercent": 95.0,
+    "movementReplicationDispatchFailurePercent": 90.0,
+    "movementReplicationCycleAvgWarningMs": 80.0,
+    "movementReplicationCycleAvgFailureMs": 100.0,
+    "movementReplicationCycleMaxWarningMs": 120.0,
+    "movementReplicationCycleMaxFailureMs": 200.0
+  },
+  "referenceByScenario": {},
+  "referenceByClients": {}
+}
+```
+
+`thresholds` sets the absolute pass/warn/fail boundaries for every check. `referenceByScenario` is populated by `--capture-baseline` after a passing run and holds the median RTT, CPU, and simulation tick values for each scenario key — these are used for relative regression checks on subsequent runs.
+
+## Key tuning parameters
+
+All constants live in `ServerSolution/ServerSolution/Common/Config.h`.
+
+<Accordion title="Threading">
+
+| Constant | Default | Notes |
+|----------|---------|-------|
+| `WORKER_THREAD_COUNT` | `4` | IOCP worker threads. Increase on machines with more physical cores. On a dual-socket host start at 8 and benchmark. |
+| `MAX_CONCURRENT_THREADS` | `0` | IOCP concurrent-threads hint. `0` means use the CPU core count. |
+| `SessionJobWorkerCount` | `4` | Threads draining the per-session job queue. Increase if `jobDropped` is non-zero in Grafana. |
+| `InventoryDbWorkerCount` | `2` | Threads for async inventory DB operations. Increase if inventory latency grows under load. |
+
+</Accordion>
+
+<Accordion title="Simulation tick">
+
+| Constant | Default | Notes |
+|----------|---------|-------|
+| `GameSimulationTickIntervalMs` | `33` | Target tick period (~30 Hz). Lowering increases CPU load and server-authoritative precision; raising reduces CPU load at the cost of movement latency. |
+| `MaxGameSimulationCommandQueueSize` | `65536` | Maximum queued commands before `moveCommandsDropped` increments. Increase if `moveCommandsDropped` is non-zero. |
+
+</Accordion>
+
+<Accordion title="Movement replication">
+
+| Constant | Default | Notes |
+|----------|---------|-------|
+| `MovementNotifyIntervalMs` | `100` | Interval between per-client movement notify cycles (10 Hz). Lowering increases bandwidth. |
+| `MovementNotifyDatagramBytes` | `1200` | Target datagram size for batch notify packets. Sized to fit within a typical 1500-byte MTU after headers. |
+| `MaxMovementReplicationPendingSnapshots` | `65536` | Hard cap on the replication backlog. If `movementReplicationPending` consistently approaches this value, increase it or reduce client count. |
+
+</Accordion>
+
+<Accordion title="Character state persistence">
+
+| Constant | Default | Notes |
+|----------|---------|-------|
+| `CharacterStateSaveBucketCount` | `10` | Number of time buckets for spreading DB writes. |
+| `CharacterStateSaveBucketIntervalSeconds` | `1.0` | Interval per bucket. Combined with `CharacterStateSaveBucketCount`, character state flushes spread across 10 seconds, preventing DB write spikes. |
+| `CharacterStateDbBatchSize` | `100` | Max characters per DB batch write. |
+
+</Accordion>
+
+## Profiling advice
+
+When `commandWaitP95Micros` or `commandWaitP99Micros` in the HTML report (or `simCommandWaitP99Ms` in Grafana) climbs above **33 ms** (one tick period) the simulation thread is spending more time waiting for commands than it has budget to process them. Possible remedies:
+
+1. **Reduce the enqueue rate** — check `moveReqReceived` versus `moveCommandsDropped`; if commands are being dropped, clients are sending faster than the tick can drain.
+2. **Lower `MovementNotifyIntervalMs`** — this reduces the number of notify callbacks queued per tick.
+3. **Raise `GameSimulationTickIntervalMs`** — gives the drain loop more wall-clock time per tick at the cost of authoritative update frequency.
+4. **Add IOCP worker threads** (`WORKER_THREAD_COUNT`) — if CPU is not saturated, more workers reduce per-packet queuing delay before commands reach the simulation queue.
+
+<Tip>
+  Run `--capture-baseline` after your first clean load test to record reference values. Subsequent runs will report regression percentages automatically, making it easy to catch performance changes introduced by new features or configuration edits.
+</Tip>

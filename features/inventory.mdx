@@ -1,0 +1,270 @@
+---
+title: "Inventory System: Items, Moves, and Consumables"
+sidebarTitle: "Inventory"
+description: "Revision-based optimistic concurrency inventory with idempotent move and use operations, persisted to MariaDB via a dedicated async worker pool."
+---
+
+The inventory system stores per-character items in MariaDB and exposes them to the game server through an in-memory `PlayerInventory` struct. Every mutation carries a monotonically increasing `revision` counter, and the client must echo the current `expected_revision` back with every request. If the revision has changed since the client last received a snapshot — for example because a server-side effect consumed an item — the operation is rejected and the client must re-read the full snapshot before retrying. A 16-byte `client_request_id` provides idempotency so retries over an unreliable connection never produce duplicate effects.
+
+## In-Memory Structures
+
+`PlayerInventory` and `InventoryItem` are defined in `Game/Inventory.h` and held directly inside the `PlayerEntity` that lives in `GameWorld`.
+
+```cpp
+// Game/Inventory.h
+namespace Game
+{
+struct InventoryItem
+{
+    uint64 instanceId  = 0;
+    uint32 templateId  = 0;
+    uint32 quantity    = 0;
+    uint32 slotIndex   = 0;
+    uint32 durability  = 0;
+};
+
+struct PlayerInventory
+{
+    uint64 revision = 0;
+    uint32 capacity = 0;
+    bool   loaded   = false;
+    std::vector<InventoryItem> items;
+};
+}
+```
+
+`loaded` is `false` until `InventoryPersistence::LoadInventoryAsync` completes after `EnterGame`. The snapshot packet is sent to the client as soon as `loaded` becomes `true`.
+
+## Protobuf Messages
+
+Items are serialised over the wire with the `InventoryItem` protobuf message:
+
+```protobuf
+message InventoryItem {
+  uint64 item_instance_id = 1;
+  uint32 template_id      = 2;
+  uint32 quantity         = 3;
+  uint32 slot_index       = 4;
+  uint32 durability       = 5;
+}
+```
+
+## Packet Flow
+
+<Steps>
+  <Step title="S_InventorySnapshot (0x0251) — initial load">
+    Sent by the server immediately after inventory is loaded from the database following `C_EnterGameReq`. Contains the complete item list.
+
+    ```protobuf
+    message S_InventorySnapshot {
+      bool                   success  = 1;
+      string                 message  = 2;
+      uint64                 revision = 3;
+      uint32                 capacity = 4;
+      repeated InventoryItem items    = 5;
+    }
+    ```
+
+    The client should store `revision` locally and use it as `expected_revision` in subsequent move and use requests.
+  </Step>
+
+  <Step title="C_InventoryMoveReq (0x0252) — move item">
+    Reposition or split a stack from one slot to another. All fields are required.
+
+    ```protobuf
+    message C_InventoryMoveReq {
+      bytes  client_request_id  = 1;  // 16 bytes, idempotency key
+      uint64 expected_revision  = 2;
+      uint64 item_instance_id   = 3;
+      uint32 source_slot        = 4;
+      uint32 destination_slot   = 5;
+      uint32 quantity           = 6;
+    }
+    ```
+
+    <ParamField body="client_request_id" type="bytes (16)" required>
+      Client-generated random 16-byte identifier. The server deduplicates on `(character_id, client_request_id)` in the `inventory_operations` table.
+    </ParamField>
+    <ParamField body="expected_revision" type="uint64" required>
+      Must equal the server's current `revision`; otherwise the operation is rejected.
+    </ParamField>
+    <ParamField body="item_instance_id" type="uint64" required>
+      The instance being moved.
+    </ParamField>
+    <ParamField body="source_slot" type="uint32" required>
+      Current slot index of the item.
+    </ParamField>
+    <ParamField body="destination_slot" type="uint32" required>
+      Target slot index. Must be within `[0, capacity)`.
+    </ParamField>
+    <ParamField body="quantity" type="uint32" required>
+      Number of units to move; must be ≤ current stack size.
+    </ParamField>
+  </Step>
+
+  <Step title="C_InventoryUseReq (0x0254) — use item">
+    Consume one unit of a usable item and trigger its effect.
+
+    ```protobuf
+    message C_InventoryUseReq {
+      bytes  client_request_id = 1;  // 16 bytes
+      uint64 expected_revision = 2;
+      uint64 item_instance_id  = 3;
+      uint32 slot_index        = 4;
+    }
+    ```
+
+    The server reads `effect_type` and `effect_value` from the item's template row. If `effect_type = 1` (Heal), `GameWorld::HealPlayer()` is called with `effect_value` hit-points before the persistence result is sent back.
+
+    **`ItemEffectType` enum (C++)**
+
+    ```cpp
+    enum class ItemEffectType : uint8
+    {
+        None = 0,
+        Heal = 1
+    };
+    ```
+  </Step>
+
+  <Step title="S_InventoryOperationResult (0x0253) — response to move or use">
+    Returned after both `C_InventoryMoveReq` and `C_InventoryUseReq`. On success `snapshot` contains the full updated inventory.
+
+    ```protobuf
+    message S_InventoryOperationResult {
+      bool                success           = 1;
+      string              message           = 2;
+      bytes               client_request_id = 3;
+      S_InventorySnapshot snapshot          = 4;
+    }
+    ```
+
+    <ResponseField name="success" type="boolean">Whether the operation was applied.</ResponseField>
+    <ResponseField name="message" type="string">Error detail when `success` is false.</ResponseField>
+    <ResponseField name="client_request_id" type="bytes">Echoed back so the client can match the response to its pending request.</ResponseField>
+    <ResponseField name="snapshot" type="S_InventorySnapshot">Full updated inventory including new revision.</ResponseField>
+  </Step>
+</Steps>
+
+## Optimistic Concurrency
+
+The server rejects any operation whose `expected_revision` does not match the current server-side `revision`. This prevents stale writes without requiring a distributed lock.
+
+```
+Client                          Server
+  |                               |
+  |-- C_InventoryUseReq           |
+  |   expected_revision = 7       |
+  |                               |-- server revision = 8 (mismatch)
+  |<-- S_InventoryOperationResult |
+  |    success = false            |
+  |    message = "revision mismatch"
+  |                               |
+  |<-- re-read S_InventorySnapshot|  (client requests fresh snapshot)
+  |    revision = 8               |
+  |                               |
+  |-- C_InventoryUseReq           |
+  |   expected_revision = 8       |-- applied ✓
+```
+
+## Persistence
+
+`InventoryPersistence` (defined in `Persistence/InventoryPersistence.h`) manages a thread pool that executes all database I/O off the game-simulation thread.
+
+```cpp
+// Persistence/InventoryPersistence.h (public API)
+bool LoadInventoryAsync    (uint64 characterId, LoadCallback callback);
+bool MoveInventoryItemAsync(InventoryMoveCommand command, OperationCallback callback);
+bool UseInventoryItemAsync (InventoryUseCommand  command, OperationCallback callback);
+```
+
+Key configuration constants from `Common/Config.h`:
+
+| Constant | Value | Purpose |
+|---|---|---|
+| `InventoryDbWorkerCount` | 2 | Thread pool size for inventory DB jobs |
+| `MaxInventoryDbQueueSize` | 4096 | Maximum queued jobs before back-pressure |
+
+## Database Schema
+
+### `character_inventories`
+
+```sql
+CREATE TABLE IF NOT EXISTS character_inventories (
+  character_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  capacity     INT UNSIGNED    NOT NULL DEFAULT 40,
+  revision     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_character_inventories_character
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+    ON DELETE CASCADE
+);
+```
+
+### `item_instances`
+
+```sql
+CREATE TABLE IF NOT EXISTS item_instances (
+  item_instance_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  character_id     BIGINT UNSIGNED NOT NULL,
+  template_id      INT UNSIGNED    NOT NULL,
+  container_type   TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  slot_index       INT UNSIGNED    NOT NULL,
+  quantity         INT UNSIGNED    NOT NULL,
+  durability       INT UNSIGNED    NOT NULL DEFAULT 0,
+  bind_flags       INT UNSIGNED    NOT NULL DEFAULT 0,
+  version          BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  created_at       TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY ux_item_instances_character_container_slot
+    (character_id, container_type, slot_index),
+  CONSTRAINT chk_item_instances_quantity CHECK (quantity > 0),
+  CONSTRAINT fk_item_instances_character
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+    ON DELETE CASCADE
+);
+```
+
+### `inventory_operations` (idempotency log)
+
+```sql
+CREATE TABLE IF NOT EXISTS inventory_operations (
+  operation_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  character_id      BIGINT UNSIGNED NOT NULL,
+  client_request_id BINARY(16)      NOT NULL,
+  operation_type    VARCHAR(32)     NOT NULL,
+  reason_code       VARCHAR(64)     NOT NULL,
+  item_instance_id  BIGINT UNSIGNED NULL,
+  quantity_delta    BIGINT          NOT NULL DEFAULT 0,
+  created_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY ux_inventory_operations_character_request
+    (character_id, client_request_id),
+  CONSTRAINT fk_inventory_operations_character
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+    ON DELETE CASCADE
+);
+```
+
+### `item_templates`
+
+```sql
+CREATE TABLE IF NOT EXISTS item_templates (
+  template_id  INT UNSIGNED NOT NULL PRIMARY KEY,
+  name         VARCHAR(100) NOT NULL,
+  max_stack    INT UNSIGNED NOT NULL DEFAULT 1,
+  usable       TINYINT(1)   NOT NULL DEFAULT 0,
+  effect_type  TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  effect_value INT          NOT NULL DEFAULT 0,
+  CONSTRAINT chk_item_templates_max_stack CHECK (max_stack > 0)
+);
+
+-- Example: Test Potion (template_id 1001) heals 30 HP
+INSERT INTO item_templates (template_id, name, max_stack, usable, effect_type, effect_value)
+VALUES (1001, 'Test Potion', 99, 1, 1, 30);
+```
+
+<Tip>
+  When `S_InventoryOperationResult` returns `success = true` but the `client_request_id` matches a previously processed request, the C++ `InventoryOperationResult::duplicate` flag is `true`. The client can detect this case by keeping a short history of recently sent `client_request_id` values and comparing them against the echoed `client_request_id` in the response. Receiving a duplicate result is safe — the item was only consumed once.
+</Tip>

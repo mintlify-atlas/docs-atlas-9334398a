@@ -1,0 +1,149 @@
+---
+title: "Session Lifecycle: Connect, Auth, and Disconnect"
+sidebarTitle: "Session Lifecycle"
+description: "Complete lifecycle of a game session from pool acquisition through TCP connection, authentication, heartbeat monitoring, job queuing, and graceful teardown with pool reuse."
+---
+
+Every player connection is represented by a `Session` object that travels through a strictly ordered set of states. `Session` objects are never constructed or destroyed during normal operation—they live in a fixed-size `SessionPool` and are recycled through `PrepareForReuse()` when a connection closes. This design avoids dynamic allocation on the hot path and gives each session a stable pool slot index (used by the AoI visibility bitset).
+
+## Session States
+
+```cpp
+enum class SessionState
+{
+    Connecting,     // AcceptEx fired; socket accepted but no data yet
+    Connected,      // Session registered, PostRecv active, ready for packets
+    Disconnecting,  // BeginDisconnect called; waiting for DisconnectEx
+    Disconnected    // DisconnectEx complete; safe to return to pool
+};
+```
+
+<Steps>
+  <Step title="Connecting">
+    After `AcceptEx` completes, `HandleAcceptCompletion` calls `Session::Reset()`, which sets the state to `Connecting`, assigns the new socket, and registers the session in the active sessions map. `PostRecv` is posted immediately so incoming data can arrive.
+  </Step>
+  <Step title="Connected">
+    Once the session is registered and the receive context is active, the state advances to `Connected`. All normal packet traffic—login, game entry, chat, combat, inventory—occurs in this state. Rate limiting, heartbeat tracking, and job queuing are all live.
+  </Step>
+  <Step title="Disconnecting">
+    `BeginDisconnect()` atomically transitions the state to `Disconnecting` and posts `DisconnectEx` with `TF_REUSE_SOCKET` so the underlying socket can be recycled without a full OS-level close. Any sends already in flight are allowed to complete.
+  </Step>
+  <Step title="Disconnected">
+    `CompleteDisconnect()` fires from the `IoType::Disconnect` worker thread completion, finalises cleanup, and calls `PrepareForReuse()` to reset all session fields before the `Session*` is returned to `SessionPool::Release()`.
+  </Step>
+</Steps>
+
+## Session Pool
+
+`SessionPool` pre-allocates all sessions at startup, eliminating heap allocation during connection handling.
+
+```cpp
+class SessionPool
+{
+public:
+    void Preallocate(std::size_t count);          // called once at startup
+    Session* Acquire(SOCKET socket, uint64 sessionId);
+    void Release(Session* session);               // returns to free list
+    ...
+};
+```
+
+| Config constant          | Value | Effect                                              |
+|--------------------------|-------|-----------------------------------------------------|
+| `InitialSessionPoolSize` | 1,024 | Sessions pre-allocated in `Preallocate()` at boot   |
+
+`Acquire()` pops a `Session*` from the internal free list and calls `Reset()` with the accepted socket and a fresh session ID. `Release()` calls `PrepareForReuse()` (which resets all state fields, clears queues, and resets atomic flags) and pushes the pointer back onto the free list.
+
+## Authentication Fields
+
+Once a session is `Connected`, identity is tracked with three plain fields on the session object:
+
+```cpp
+bool        authenticated = false;   // set true after token validation
+uint64      accountId     = 0;       // resolved from the enter token
+uint64      characterId   = 0;       // provided in C_EnterGameReq
+std::string account;                 // account name string (for logging)
+```
+
+Packets that require authentication check `authenticated` early in their handler and return `S_ErrorRes` with `ERROR_CODE_AUTH_REQUIRED` if the flag is not set.
+
+## Heartbeat Mechanism
+
+The server sends periodic ping packets and disconnects sessions that stop responding.
+
+```cpp
+uint64 PrepareHeartbeatPing();                              // increments sequence, records send time
+void   MarkHeartbeatAlive();                                // updates lastHeartbeatTime_ on pong
+bool   IsHeartbeatTimedOut(std::chrono::milliseconds) const;
+uint64 GetHeartbeatAgeMs() const;
+```
+
+| Config constant            | Value | Behaviour                                                    |
+|----------------------------|-------|--------------------------------------------------------------|
+| `HeartbeatIntervalSeconds` | 5     | Frequency at which the server sends `PacketIdPing`           |
+| `HeartbeatTimeoutSeconds`  | 15    | Age after which a session is considered dead and disconnected |
+
+`StartHeartbeatTimer()` in `IOCPServer` uses `TimerManager` to schedule `DriveHeartbeat()` every `HeartbeatIntervalSeconds` seconds. `DriveHeartbeat` iterates all authenticated sessions, sends a `Ping`, and calls `BeginDisconnect` on any session whose heartbeat age exceeds `HeartbeatTimeoutSeconds * 1000 ms`.
+
+## Send Queue
+
+Sends are always asynchronous. When a packet is enqueued while a send is already in flight, it sits in a mutex-protected `deque` until `TryPostNextSend()` is called from the `IoType::Send` completion:
+
+```cpp
+struct PendingSend {
+    SendPacketBufferPtr packet;
+    std::size_t offset = 0;   // bytes already sent for partial completions
+};
+std::deque<PendingSend> sendQueue_;   // protected by sendMutex_
+```
+
+`TryPostNextSend()` pops the next entry from `sendQueue_` and posts a `WSASend`. If the queue is empty, `sendPending_` is set to `false` so the next `PostSend` will start a new chain.
+
+## Rate Limiting
+
+Incoming packet rate is enforced per session with a sliding window:
+
+```cpp
+bool RecordIncomingPacket();   // returns false when limit exceeded
+```
+
+| Config constant       | Value | Behaviour                                            |
+|-----------------------|-------|------------------------------------------------------|
+| `MaxPacketsPerSecond` | 100   | Maximum incoming packets per one-second window       |
+
+If `RecordIncomingPacket()` returns `false`, the server sends `S_ErrorRes` with `ERROR_CODE_RATE_LIMITED` and discards the packet.
+
+## Job Queue
+
+Work can be serialised onto a session's logical thread to avoid locks:
+
+```cpp
+bool PostJob(std::function<void()> job);    // enqueues work; returns false if queue full
+void DrainJobQueue(uint64 expectedSessionId);
+```
+
+| Config constant        | Value | Behaviour                                              |
+|------------------------|-------|--------------------------------------------------------|
+| `MaxSessionJobQueueSize` | 1,024 | Jobs dropped (with metric increment) beyond this limit |
+| `SessionJobWorkerCount`  | 4     | Worker threads in `SessionJobScheduler`                |
+
+`PostJob` pushes a `PendingJob` onto `jobQueue_` and, if no job is currently running, enqueues the session into `SessionJobScheduler`. The scheduler calls `DrainJobQueue`, which pops and executes jobs in FIFO order while holding a lightweight in-progress flag.
+
+## Session Teardown
+
+<Warning>
+`ForceClose()` shuts the socket immediately without `DisconnectEx` and is reserved for error paths (e.g. malformed packets, unrecoverable send failures). It skips socket reuse. For all normal disconnects—voluntary client quit, heartbeat timeout, or game logic—use `BeginDisconnect()` to preserve socket recycling.
+</Warning>
+
+Normal teardown sequence:
+
+```
+BeginDisconnect()
+  └─ posts DisconnectEx (TF_REUSE_SOCKET)
+       └─ IoType::Disconnect completion fires
+            └─ CompleteDisconnect()
+                 └─ PrepareForReuse()
+                      └─ SessionPool::Release()  ← ready for next Accept
+```
+
+`PrepareForReuse()` clears `authenticated`, zeroes `accountId`/`characterId`, resets atomic flags, empties `sendQueue_` and `jobQueue_`, and resets `recvBuffer_`. The socket handle itself is retained and reused by the next `AcceptEx` call.

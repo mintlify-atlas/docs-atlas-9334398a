@@ -1,20 +1,66 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "UE5 IOCP MMO Server: High-Performance Multiplayer Backend"
+sidebarTitle: "Home"
+description: "A Windows IOCP C++ game server, ASP.NET Core auth service, and UE5 client for building real-time MMO games with TCP/UDP networking, AoI, inventory, and monster AI."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+The UE5 IOCP MMO Server is a complete multiplayer backend stack built for Unreal Engine 5 games. The C++ game server uses Windows I/O Completion Ports (IOCP) for high-throughput asynchronous networking, handling up to 10,000 concurrent TCP sessions alongside a low-latency UDP channel for movement replication. An ASP.NET Core authentication service manages accounts, tokens, and server selection, while MariaDB and Redis back persistence and session state.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Introduction" icon="book-open" href="/introduction">
+    Learn what the server does, what technologies it uses, and how the pieces fit together.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Explore the three-tier architecture: Unreal client → AuthServer → IOCP GameServer.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Stand up MariaDB, Redis, the AuthServer, and the GameServer locally in minutes.
+  </Card>
+  <Card title="Packet Protocol" icon="network-wired" href="/systems/packet-protocol">
+    Full reference for every protobuf packet ID used by the TCP and UDP transports.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What's Inside
+
+<CardGroup cols={3}>
+  <Card title="IOCP Network" icon="server" href="/systems/iocp-network">
+    Windows IOCP async I/O, worker threads, and session pooling.
+  </Card>
+  <Card title="Movement Replication" icon="arrows-up-down-left-right" href="/systems/movement-replication">
+    Hybrid TCP/UDP movement with AoI batching and client prediction.
+  </Card>
+  <Card title="Game Simulation" icon="gamepad" href="/systems/game-simulation">
+    Fixed-interval tick loop, command queue, and server-authoritative physics.
+  </Card>
+  <Card title="Auth Flow" icon="key" href="/features/auth-flow">
+    Register, login, server selection, and enter-game token handshake.
+  </Card>
+  <Card title="Inventory" icon="box-archive" href="/features/inventory">
+    Revision-based optimistic concurrency for item moves and consumables.
+  </Card>
+  <Card title="Monitoring" icon="chart-line" href="/ops/monitoring">
+    Prometheus metrics endpoint, Grafana dashboard, and CSV perf logs.
+  </Card>
+</CardGroup>
+
+## Getting Started
+
+<Steps>
+  <Step title="Start the infrastructure">
+    Run `docker compose up -d` in `ServerSolution/Infra/` to start MariaDB and Redis. The database schema is applied automatically from the `mariadb/init/` SQL files.
+  </Step>
+  <Step title="Configure and run the AuthServer">
+    Set the MariaDB connection string and Redis address in `ServerSolution/AuthServer/appsettings.json`, then run `dotnet run` from the `AuthServer/` directory. The server starts on port 5000 by default.
+  </Step>
+  <Step title="Configure and run the GameServer">
+    Copy `Database.example.ini` to `Database.ini` and `Redis.example.ini` to `Redis.ini`, fill in your credentials, build the Visual Studio solution in Release mode, then launch `ServerSolution.exe`. The server listens on TCP/UDP port 7777 and exposes Prometheus metrics on port 9108.
+  </Step>
+  <Step title="Connect the UE5 client">
+    Open `MMOClient1/MMOClient1.uproject` in Unreal Engine 5.4. Point `AuthClientSubsystem` at your AuthServer URL and `GameClientSubsystem` at the game server address, then Play In Editor.
+  </Step>
+</Steps>
+
+<Note>
+  The GameServer is a **Windows-only** binary that relies on WinSock2 IOCP APIs (`CreateIoCompletionPort`, `AcceptEx`, `DisconnectEx`). Linux is not supported.
+</Note>

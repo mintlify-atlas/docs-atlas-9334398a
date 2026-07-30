@@ -1,0 +1,117 @@
+---
+title: "Movement Replication: UDP Batching and Prediction"
+sidebarTitle: "Movement Replication"
+description: "How the server receives C_MoveReq over UDP, applies server-authoritative movement physics, batches snapshots into MoveBatchNotify datagrams, and supports client-side prediction reconciliation."
+---
+
+Player movement uses a hybrid transport model. Clients send `C_MoveReq` over UDP—connectionless, low-latency, drop-tolerant—and the server responds with authoritative position updates batched into `S_MoveBatchNotify` datagrams delivered over the same UDP socket. TCP carries only the reliable subset of game events (combat acknowledgements, inventory operations, chat). This split keeps the TCP stream free from the high-frequency movement traffic that would otherwise head-of-line block more important packets.
+
+## MovementReplication Class
+
+`MovementReplication` runs a dedicated background thread that wakes every `MovementNotifyIntervalMs = 100 ms` and dispatches all pending snapshots in a single pass.
+
+```cpp
+class MovementReplication
+{
+public:
+    using PendingSnapshots = std::unordered_map<uint64, Session::MovementSnapshot>;
+    using DispatchCallback = std::function<void(const PendingSnapshots&)>;
+
+    bool Start(
+        std::chrono::milliseconds interval,        // 100 ms from Config
+        std::size_t maxPendingSnapshots,           // 65536 from Config
+        DispatchCallback dispatchCallback);
+
+    void Stop();
+
+    bool Publish(uint64 sessionId, const Session::MovementSnapshot& snapshot);
+};
+```
+
+`Publish()` inserts or **replaces** the latest snapshot for `sessionId` in `latestSnapshots_`. If a snapshot already exists for that session it is overwritten—old positions are never queued, only the most recent state matters. This replacement strategy is what keeps replication traffic flat under high player density: each session contributes at most one entry per dispatch cycle regardless of how many movement inputs arrived since the last cycle.
+
+Every 100 ms the dispatch thread swaps `latestSnapshots_` under the mutex, then invokes `DispatchCallback` with the collected map. `IOCPServer::DispatchMovementReplicationBatch` is the registered callback; it iterates snapshots, resolves AoI peers for each mover, and packs entries into UDP datagrams.
+
+## MovementSnapshot Fields
+
+```cpp
+struct Session::MovementSnapshot
+{
+    uint64 characterId                 = 0;
+    uint32 lastProcessedInputSequence  = 0;  // echo of the last accepted C_MoveReq sequence
+    float  x                           = 0.f;
+    float  y                           = 0.f;
+    float  z                           = 0.f;
+    float  velocityX                   = 0.f;
+    float  velocityY                   = 0.f;
+    float  velocityZ                   = 0.f;
+    float  yaw                         = 0.f;
+};
+```
+
+The snapshot is produced by `Session::StepMovement()` during the **PlayerMovement** tick phase and published to `MovementReplication` immediately after the step completes.
+
+## Datagram Batching
+
+Snapshots destined for the same AoI peer are packed into a single UDP datagram up to `MovementNotifyDatagramBytes = 1200` bytes. This stays well under the typical Ethernet MTU of 1,500 bytes to avoid IP fragmentation.
+
+| Constant                          | Value   | Role                                                      |
+|-----------------------------------|---------|-----------------------------------------------------------|
+| `MovementNotifyIntervalMs`        | 100 ms  | Dispatch cycle period                                     |
+| `MovementNotifyDatagramBytes`     | 1,200 B | Maximum UDP payload per datagram                          |
+| `MaxMovementReplicationPendingSnapshots` | 65,536 | Snapshots dropped beyond this high-water mark     |
+
+With a 4-byte `PacketHeader` + 12-byte `MoveBatchNotifyHeader` + 40 bytes per `MoveBatchNotifyEntry`:
+
+```
+max_entries = floor((1200 - 16) / 40) = 29 players per datagram
+```
+
+If a peer has more than 29 AoI neighbors moving simultaneously, multiple datagrams are sent back-to-back within the same dispatch cycle.
+
+## Client Prediction and Reconciliation
+
+The server implements a standard predict-and-reconcile loop compatible with Unreal Engine's built-in Character Movement Component prediction model.
+
+**Client side:**
+1. Apply input locally without waiting for a server response.
+2. Stamp the input with a monotonically increasing `input_sequence`.
+3. Send `C_MoveReq` over UDP.
+4. Buffer the unacknowledged input locally.
+
+**Server side:**
+1. `HandleUdpMove()` receives `C_MoveReq`, enqueues an `ApplyMoveCommand` into the game simulation via `EnqueueMoveCommand()`.
+2. During the **PlayerMovement** tick phase, `StepMovement()` integrates the input and produces a new `MovementSnapshot`.
+3. `lastProcessedInputSequence` in the snapshot is set to the sequence number of the input that was just applied.
+4. The snapshot is published to `MovementReplication` and also echoed directly to the mover as `S_MoveNotify` over TCP (as a reliable authoritative correction).
+
+**Client reconciliation:**
+When the client receives `last_processed_input_sequence` in `S_MoveNotify` or `S_MoveBatchNotify`, it discards all locally buffered inputs with sequence ≤ that value and re-simulates from the authoritative position using the remaining unacknowledged inputs. This eliminates rubber-banding caused by latency while keeping the server fully authoritative.
+
+## Server-Side Movement Physics
+
+`StepMovement()` applies the same acceleration/friction model used by Unreal's `UCharacterMovementComponent`, ensuring the server and client simulate identical trajectories for the same input sequence.
+
+```cpp
+bool Session::StepMovement(float deltaSeconds, MovementSnapshot& outSnapshot);
+```
+
+Physics constants from `Config.h`:
+
+| Constant                             | Value   | Meaning                                                   |
+|--------------------------------------|---------|-----------------------------------------------------------|
+| `MovementMaxWalkSpeed`               | 500 UU/s| Maximum ground speed                                      |
+| `MovementMaxAcceleration`            | 800 UU/s²| Acceleration applied when input is non-zero              |
+| `MovementBrakingDecelerationWalking` | 750 UU/s²| Deceleration applied when no input                       |
+| `MovementGroundFriction`             | 5.0     | Friction scale factor applied each tick                   |
+| `MovementBrakingFrictionFactor`      | 1.0     | Additional multiplier on braking deceleration             |
+| `MovementMinAnalogWalkSpeed`         | 150 UU/s| Minimum speed for partial analog stick input              |
+| `MovementInputDeadZone`              | 0.01    | Input magnitudes below this are treated as zero           |
+| `MovementInputTimeoutMs`             | 250 ms  | After this many ms without a `C_MoveReq`, input clears   |
+| `MaxMovementDeltaSeconds`            | 0.05 s  | Clamps delta to prevent large steps from network jitter   |
+
+When no `C_MoveReq` arrives for more than `MovementInputTimeoutMs = 250 ms`, the session's movement input is cleared and the character decelerates to a stop under `MovementBrakingDecelerationWalking`.
+
+<Tip>
+Compare `movementReplicationPublished` and `movementReplicationDispatched` in Grafana to check replication health. `Published` counts how many snapshots were submitted by the movement phase; `Dispatched` counts how many were actually delivered in a dispatch cycle. A widening gap between the two indicates that the 100 ms dispatch interval is producing more replacements (`movementReplicationReplaced`) than deliveries, which can happen when the AoI peer-resolution or UDP send path is becoming a bottleneck.
+</Tip>

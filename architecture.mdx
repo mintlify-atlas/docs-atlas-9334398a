@@ -1,0 +1,195 @@
+---
+title: "System Architecture of the UE5 IOCP MMO Server"
+sidebarTitle: "Architecture"
+description: "A deep-dive into the three-tier design: ASP.NET Core AuthServer, C++ IOCP GameServer, and UE5.4 client — their responsibilities, data stores, and the full connection flow."
+---
+
+The UE5 IOCP MMO Server follows a three-tier architecture that cleanly separates authentication concerns from real-time gameplay concerns. An ASP.NET Core 8 **AuthServer** owns all pre-game flows — registration, login, server listing, and server selection — and issues cryptographically random tokens that are stored in Redis. The C++ IOCP **GameServer** owns session state and all real-time gameplay, and only processes a session after it has presented a valid enter token. The **UE5 client** keeps these two flows in separate subsystems (`AuthClientSubsystem` for HTTP and `GameClientSubsystem` for TCP/UDP), ensuring the UI layer never mixes lobby and gameplay logic.
+
+## System Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Unreal Engine 5.4 Client                 │
+│                                                                 │
+│  AuthClientSubsystem (HTTP)    GameClientSubsystem (TCP + UDP)  │
+└──────────┬──────────────────────────────┬───────────────────────┘
+           │ HTTP (REST/JSON)             │ TCP :7777  UDP :7777
+           ▼                             ▼
+┌──────────────────────┐     ┌───────────────────────────────────┐
+│  ASP.NET Core        │     │  C++ IOCP GameServer              │
+│  AuthServer          │     │                                   │
+│  POST /auth/register │     │  TCP: reliable gameplay packets   │
+│  POST /auth/login    │     │  UDP: movement replication        │
+│  GET  /servers       │     │  HTTP :9108 Prometheus metrics    │
+│  POST /auth/         │     │                                   │
+│       select-server  │     │  ┌─────────────┐  ┌───────────┐  │
+└──────┬───────────────┘     │  │  MariaDB 11 │  │  Redis 7  │  │
+       │                     │  │  (game DB)  │  │  (tokens) │  │
+       ▼                     │  └─────────────┘  └───────────┘  │
+┌─────────────────────┐      └───────────────────────────────────┘
+│  MariaDB 11         │                    ▲
+│  accounts           │                    │
+│  characters         │──── schema shared ─┘
+│  servers            │
+├─────────────────────┤
+│  Redis 7            │
+│  access tokens      │
+│  enter tokens       │
+└─────────────────────┘
+```
+
+---
+
+## AuthServer (ASP.NET Core 8)
+
+The AuthServer is a minimal-API service that runs independently of the game server. It is the only component that stores and verifies passwords. Passwords are hashed with PBKDF2 via `Pbkdf2PasswordHasher` before being written to MariaDB.
+
+### REST Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Health probe — returns `{"service":"AuthServer","status":"ok"}` |
+| `POST` | `/auth/register` | Creates a new account. Account: 4–64 chars; Password: 8–128 chars |
+| `POST` | `/auth/login` | Validates credentials and issues a short-lived access token (default TTL: 60 minutes) |
+| `GET` | `/servers` | Returns the list of available game servers from the `servers` table |
+| `POST` | `/auth/select-server` | Validates the access token, resolves or creates the player's default character, then issues a one-time enter token (default TTL: 60 seconds) |
+
+### Token Flow
+
+```csharp
+// From AuthServer/Program.cs — select-server issues an enter token
+var enterToken = await tokenService.IssueEnterTokenAsync(
+    claims.AccountId,
+    server.ServerId,
+    character.CharacterId,
+    claims.Nickname);
+
+return Results.Ok(new SelectServerResponse(
+    true,
+    server.Ip,
+    server.Port,
+    enterToken,
+    character.CharacterId,
+    "select server ok"));
+```
+
+The `SelectServerResponse` delivers the game server IP, port, enter token, and character ID to the client in a single response. The client never dials the game server until this step completes successfully.
+
+### Data Stores
+
+- **MariaDB 11** — `accounts`, `characters`, and `servers` tables. Schema is initialised automatically from `ServerSolution/Infra/mariadb/init/` on first container start.
+- **Redis 7** — Stores issued access tokens and enter tokens as key-value entries with TTL. The `DuplicateLoginPolicy` (default: `InvalidatePrevious`) ensures old tokens are revoked when a player logs in again.
+
+---
+
+## IOCP GameServer (C++)
+
+The GameServer is a single Windows executable built from `ServerSolution/ServerSolution/`. It creates an IOCP handle, binds a TCP listen socket and a UDP socket, and drives a pool of worker threads that dequeue completion events.
+
+```cpp
+// From main.cpp — the entire entry point
+int main()
+{
+    if (!Logger::Initialize())
+        return 1;
+
+    int result = 0;
+    {
+        Network::IOCPServer server;
+        result = server.Run();
+    }
+
+    Logger::Shutdown();
+    return result;
+}
+```
+
+### Network Layers
+
+| Transport | Port | Purpose |
+|---|---|---|
+| TCP | 7777 | Reliable delivery of all gameplay packets (enter-game, chat, attack, inventory) |
+| UDP | 7777 | Low-latency movement input and batched position replication (`MoveBatchNotify`) |
+| HTTP | 9108 | Prometheus metrics scrape endpoint (`/metrics` and `/health`) |
+
+Movement datagrams are capped at `MovementNotifyDatagramBytes = 1200` bytes to stay well under typical MTU limits and are dispatched every 100 ms.
+
+### Packet Protocol
+
+All TCP payloads are framed with a 4-byte `PacketHeader` (2-byte size + 2-byte packet ID) and serialised with Protocol Buffers:
+
+```cpp
+// From Network/Protocol.h
+#pragma pack(push, 1)
+struct PacketHeader
+{
+    uint16 size = 0;
+    uint16 packetId = 0;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(PacketHeader) == 4);
+```
+
+The `PacketId` enum ranges cover system packets (`0x0001`–`0x00FF`), game packets (`0x0200`–`0x02FF`). Auth-range IDs (`0x0100`–`0x01FF`) are marked deprecated because those flows have moved to the AuthServer.
+
+### Game Simulation
+
+The server ticks a `GameSimulation` at `GameSimulationTickIntervalMs = 33 ms` (~30 Hz). Each tick:
+1. Drains the movement command queue (per-session input sequences).
+2. Runs monster AI state machines (patrol, chase, attack, death).
+3. Resolves pending melee and ranged attack hits.
+4. Broadcasts `MoveBatchNotify` UDP datagrams to AoI peers.
+5. Queues dirty `CharacterState` snapshots for batched MariaDB writes.
+
+### Data Stores
+
+- **MariaDB 11** — Character position, HP, and inventory item instances. Character state is saved in staggered bucket batches (`CharacterStateDbBatchSize = 100`) to flatten write spikes.
+- **Redis 7** — Enter-token validation. The `RedisTokenValidator` looks up the token presented in `C_EnterGameReq` before admitting the session to gameplay.
+
+---
+
+## UE5 Client (Unreal Engine 5.4)
+
+The client is split into two Subsystems following the rule stated in `AGENTS.md`:
+
+```
+AuthClientSubsystem  =  HTTP login / register / server-list / server-select
+GameClientSubsystem  =  TCP GameServer connection / gameplay packets
+```
+
+The `MMOClient1` module depends on Engine and UMG, and enables animation plugins (`AnimationWarping`, `PoseSearch`, `MotionWarping`, `AnimationLocomotionLibrary`) for character locomotion. Protocol Buffers messages are compiled from `ServerSolution/ServerSolution/Proto/Packet.proto` and shared between client and server — both must be updated together when the protocol changes.
+
+---
+
+## Full Connection Flow
+
+<Steps>
+  <Step title="Register">
+    Client sends `POST /auth/register` with `account`, `password`, and optional `nickname`. AuthServer hashes the password with PBKDF2 and writes the row to MariaDB `accounts`.
+  </Step>
+  <Step title="Login">
+    Client sends `POST /auth/login`. AuthServer verifies the PBKDF2 hash and, on success, issues an access token stored in Redis with a 60-minute TTL. The token and `accountId` are returned to the client.
+  </Step>
+  <Step title="Browse & Select Server">
+    Client calls `GET /servers` to display the server list, then `POST /auth/select-server` with the chosen `serverId` and the access token. AuthServer validates the token, ensures the player has a default character on that server, and returns `{ip, port, enterToken, characterId}`.
+  </Step>
+  <Step title="TCP Connect & Enter Game">
+    `GameClientSubsystem` opens a TCP connection to `ip:port`. It sends `C_EnterGameReq` containing `enter_token` and `character_id`. The GameServer calls `RedisTokenValidator`, loads the character state from MariaDB, registers the player entity in the AoI grid, and responds with `S_EnterGameRes` (which includes a `udp_token` and `udp_port`).
+  </Step>
+  <Step title="UDP Handshake">
+    The client sends `C_UdpHelloReq` over UDP with `udp_token`, `account_id`, and `character_id`. The GameServer locates the session by token and associates the UDP endpoint. From this point movement inputs travel over UDP.
+  </Step>
+  <Step title="Gameplay Loop">
+    - Player input → `C_MoveReq` (UDP) → server applies movement, enqueues snapshot.
+    - Every 100 ms, server sends `MoveBatchNotify` (UDP) to all AoI peers.
+    - Attack input → `C_AttackReq` (TCP) → server validates timing, resolves hit, broadcasts `S_AttackNotify`.
+    - Inventory actions → `C_InventoryMoveReq` / `C_InventoryUseReq` (TCP) → MariaDB write → `S_InventoryOperationResult`.
+    - Chat → `C_ChatReq` (TCP) → broadcast `S_ChatNtf` to all sessions.
+  </Step>
+</Steps>
+
+<Note>
+  Responsibility separation is a core rule of this project. The AuthServer must never process gameplay packets, and the GameServer must never handle registration, login, server listing, or server selection. Keeping these boundaries intact makes each component independently testable and deployable.
+</Note>

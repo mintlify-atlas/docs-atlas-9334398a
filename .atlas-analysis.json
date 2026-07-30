@@ -1,0 +1,106 @@
+{
+  "projectType": "infrastructure",
+  "projectName": "UE5 IOCP MMO Server",
+  "projectDescription": "A high-performance Windows IOCP C++ game server with an ASP.NET Core auth service and Unreal Engine 5 client, implementing real-time TCP/UDP multiplayer, Area of Interest management, inventory persistence, monster AI, and Prometheus/Grafana monitoring.",
+  "theme": "aspen",
+  "primaryColor": "#2563EB",
+  "lightColor": "#DBEAFE",
+  "darkColor": "#1E3A8A",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "architecture",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Server Setup",
+            "pages": [
+              "server/gameserver-config",
+              "server/authserver-config",
+              "server/database-schema",
+              "server/infra-docker"
+            ]
+          },
+          {
+            "group": "Core Systems",
+            "pages": [
+              "systems/iocp-network",
+              "systems/session-lifecycle",
+              "systems/packet-protocol",
+              "systems/game-simulation",
+              "systems/movement-replication",
+              "systems/aoi"
+            ]
+          },
+          {
+            "group": "Game Features",
+            "pages": [
+              "features/auth-flow",
+              "features/inventory",
+              "features/combat-monsters",
+              "features/chat"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "ops/monitoring",
+              "ops/performance",
+              "ops/load-testing"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Client Integration",
+        "groups": [
+          {
+            "group": "UE5 Client",
+            "pages": [
+              "client/overview",
+              "client/auth-subsystem",
+              "client/game-subsystem",
+              "client/proto-packets"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Windows IOCP (I/O Completion Port) TCP server supporting up to 10,000 concurrent sessions",
+    "Hybrid TCP + UDP transport: reliable packets over TCP, low-latency movement over UDP",
+    "ASP.NET Core AuthServer with PBKDF2 password hashing, JWT-style tokens in Redis",
+    "Area of Interest (AoI) cell grid for efficient player/monster visibility culling",
+    "Server-authoritative movement replication with client-side prediction support",
+    "Monster AI with idle/chase/ranged-attack/melee-attack/return states",
+    "Inventory persistence with optimistic concurrency (revision-based) backed by MariaDB",
+    "Character state persistence with bucketed async saves",
+    "Prometheus metrics endpoint + Grafana dashboard for real-time monitoring",
+    "Protocol Buffers (protobuf) binary packet serialization",
+    "MoveLoadTester C# tool for multi-client movement load testing",
+    "PerformanceReport tool for CSV/HTML analysis of load test results"
+  ],
+  "publicApiSurface": [
+    "POST /auth/register — create a new account",
+    "POST /auth/login — authenticate and receive an access token",
+    "GET /servers — list available game servers",
+    "POST /auth/select-server — exchange access token for an enter token + game server IP/port",
+    "TCP PacketId 0x0201 C_EnterGameReq — enter game session with enter token",
+    "TCP PacketId 0x0204 C_UdpHelloReq — register UDP endpoint",
+    "UDP PacketId 0x0211 C_MoveReq — send movement input",
+    "TCP PacketId 0x0221 C_ChatReq — send chat message",
+    "TCP PacketId 0x0231 C_AttackReq — send attack command",
+    "TCP PacketId 0x0252 C_InventoryMoveReq — move inventory item",
+    "TCP PacketId 0x0254 C_InventoryUseReq — use inventory item",
+    "HTTP GET /metrics — Prometheus metrics (port 9108)",
+    "HTTP GET /health — health check endpoint (port 9108)"
+  ]
+}

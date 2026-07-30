@@ -1,0 +1,182 @@
+---
+title: "Global Chat: Sending and Receiving Messages"
+sidebarTitle: "Chat"
+description: "Simple global TCP broadcast chat: clients send C_ChatReq and every authenticated session receives S_ChatNtf with the sender's ID, name, and message."
+---
+
+Chat uses the same TCP connection as all other game packets. There is no separate chat server or channel layer — when any authenticated session sends a `C_ChatReq`, the game server validates the message length and immediately broadcasts an `S_ChatNtf` to every connected session that has completed the `EnterGame` handshake. Because the broadcast is server-side, the sender also receives its own message back, which is the simplest way for the client to confirm delivery.
+
+## Sending a Message: C_ChatReq (0x0221)
+
+```protobuf
+message C_ChatReq {
+  string message = 1;
+}
+```
+
+<ParamField body="message" type="string" required>
+  Plain UTF-8 text. The server enforces a hard limit of `MaxChatMessageLength` = **512 characters** (from `Common/Config.h`). Messages that exceed this limit are silently dropped and no response is sent to the client.
+</ParamField>
+
+```cpp
+// Common/Config.h
+constexpr std::size_t MaxChatMessageLength = 512;
+```
+
+The server does not acknowledge `C_ChatReq` with a dedicated response packet. Delivery confirmation is implicit: the sender will receive the broadcasted `S_ChatNtf` alongside every other session.
+
+## Receiving a Message: S_ChatNtf (0x0222)
+
+```protobuf
+message S_ChatNtf {
+  uint64 sender_id   = 1;
+  string sender_name = 2;
+  string message     = 3;
+}
+```
+
+<ResponseField name="sender_id" type="uint64">
+  `account_id` of the player who sent the message. Clients can use this to detect their own messages (compare against the locally stored account ID received in `S_EnterGameRes`).
+</ResponseField>
+<ResponseField name="sender_name" type="string">
+  The sender's nickname as stored in the account record; supplied by the server directly, so clients cannot spoof display names.
+</ResponseField>
+<ResponseField name="message" type="string">
+  The verbatim message text, at most 512 characters.
+</ResponseField>
+
+## Full Protobuf Definitions
+
+Both messages are declared in `ServerSolution/Proto/Packet.proto` alongside all other game protocol messages:
+
+```protobuf
+// Proto/Packet.proto (excerpt)
+message C_ChatReq {
+  string message = 1;
+}
+
+message S_ChatNtf {
+  uint64 sender_id   = 1;
+  string sender_name = 2;
+  string message     = 3;
+}
+```
+
+Packet IDs are assigned in `Network/Protocol.h`:
+
+```cpp
+// Network/Protocol.h
+PacketIdChatReq = 0x0221,
+PacketIdChatNtf = 0x0222,
+```
+
+## UE5 Client Integration
+
+The UE5 client wires chat through `UGameClientSubsystem`, which owns the TCP connection and exposes a `SendChatMessage` method and an `OnChatMessageReceived` delegate:
+
+```cpp
+// Network/GameClientSubsystem.h (relevant declarations)
+UPROPERTY(BlueprintAssignable)
+FChatMessageReceived OnChatMessageReceived;   // (int64 SenderId, FString SenderName, FString Message)
+
+UFUNCTION(BlueprintCallable)
+bool SendChatMessage(const FString& Message);
+```
+
+`UChatWidget` (defined in `UI/ChatWidget.h` / `UI/ChatWidget.cpp`) is a `UUserWidget` subclass that binds to those hooks:
+
+<Steps>
+  <Step title="NativeConstruct — binding the subsystem delegate">
+    When the widget is added to the viewport, `NativeConstruct` looks up `UGameClientSubsystem` via the `GameInstance` and registers `HandleChatMessageReceived` as a listener:
+
+    ```cpp
+    // UI/ChatWidget.cpp
+    void UChatWidget::NativeConstruct()
+    {
+        Super::NativeConstruct();
+        // ...
+        if (UGameClientSubsystem* GCS = GetGameClientSubsystem())
+        {
+            GCS->OnChatMessageReceived.AddUniqueDynamic(
+                this, &UChatWidget::HandleChatMessageReceived);
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="HandleChatMessageReceived — appending to the log">
+    Each inbound `S_ChatNtf` triggers the delegate, which calls `AddChatMessage`. The widget formats the line as `"SenderName : Message"`, appends it to the `ChatMessages` array (capped at `MaxVisibleMessages` = 100), rebuilds the `UScrollBox` content, and scrolls to the bottom:
+
+    ```cpp
+    void UChatWidget::HandleChatMessageReceived(
+        int64 SenderId, const FString& SenderName, const FString& Message)
+    {
+        AddChatMessage(SenderName, Message);
+    }
+
+    void UChatWidget::AddChatMessage(const FString& SenderName, const FString& Message)
+    {
+        const FString Line = FString::Printf(TEXT("%s : %s"), *SenderName, *Message);
+        ChatMessages.Add(Line);
+        while (ChatMessages.Num() > MaxVisibleMessages)
+            ChatMessages.RemoveAt(0);
+
+        RebuildChatLog();
+        ChatLog->ScrollToEnd();
+    }
+    ```
+  </Step>
+
+  <Step title="SubmitChat — sending to the server">
+    When the player presses Enter in the chat input widget, `SubmitChat` trims whitespace, calls `GameClientSubsystem::SendChatMessage`, and closes the input field:
+
+    ```cpp
+    bool UChatWidget::SubmitChat()
+    {
+        const FString Message = GetChatInputText().TrimStartAndEnd();
+        if (Message.IsEmpty())
+        {
+            CloseChat();
+            return false;
+        }
+
+        bool bSent = false;
+        if (UGameClientSubsystem* GCS = GetGameClientSubsystem())
+            bSent = GCS->SendChatMessage(Message);
+
+        CloseChat();
+        return bSent;
+    }
+    ```
+
+    The input widget (either `UEditableText` or `UEditableTextBox` — resolved at runtime via `Cast`) commits on `ETextCommit::OnEnter`, which forwards to `SubmitChat` through `HandleChatTextCommitted`.
+  </Step>
+
+  <Step title="NativeDestruct — unbinding">
+    On widget removal, `NativeDestruct` removes the dynamic delegate binding so the subsystem does not hold a dangling reference:
+
+    ```cpp
+    void UChatWidget::NativeDestruct()
+    {
+        UnbindChatInput();
+        if (UGameClientSubsystem* GCS = GetGameClientSubsystem())
+            GCS->OnChatMessageReceived.RemoveDynamic(
+                this, &UChatWidget::HandleChatMessageReceived);
+        Super::NativeDestruct();
+    }
+    ```
+  </Step>
+</Steps>
+
+## Limitations
+
+The current implementation is intentionally minimal:
+
+- **Global scope only** — every authenticated session receives every chat message regardless of location or zone.
+- **No message history** — the server has no chat log; clients that connect after a message was sent will not see it.
+- **No profanity or spam filter** — the only server-side validation is the 512-character length check.
+- **No channel support** — there is no concept of party, guild, or zone channels.
+
+<Tip>
+  To scope chat to a geographic zone, filter the broadcast loop by AoI cell membership rather than iterating all sessions. The AoI cell grid is already maintained for movement replication (cell size = `MovementAoiCellSize` = 3000 units), so you can reuse the same cell-lookup to find sessions that share a cell with the sender before calling `S_ChatNtf` broadcast.
+</Tip>

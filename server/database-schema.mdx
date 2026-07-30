@@ -1,0 +1,269 @@
+---
+title: "MariaDB Schema for the MMO Server"
+sidebarTitle: "Database Schema"
+description: "Full CREATE TABLE reference for every table in the game database, including inventory, item templates, and character state persistence."
+---
+
+The `game` database schema is applied automatically when the MariaDB container starts for the first time. Docker mounts the `ServerSolution/Infra/mariadb/init/` directory to `/docker-entrypoint-initdb.d` inside the container, and MariaDB executes every `.sql` file in lexicographic order — meaning migrations `001` through `005` run in sequence on a fresh volume. A consolidated `Schema.sql` at the solution root reflects the final combined state and can be used to provision a non-Docker database directly.
+
+<Note>
+The `allow_dev_fallback=true` flag in `Database.ini` keeps the hardcoded `test` / `1234` credential pair functional even when the MySQL server is unreachable. This lets frontend or client engineers iterate without a live database. Set `allow_dev_fallback=false` in any shared or production environment.
+</Note>
+
+## 001\_schema.sql — Core tables
+
+The foundation migration creates the database, character roster, and server registry, and seeds one test account plus three game server entries.
+
+<Expandable title="001_schema.sql — full source">
+```sql
+CREATE DATABASE IF NOT EXISTS game
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+USE game;
+
+CREATE TABLE IF NOT EXISTS accounts (
+  account_id   BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  account_name VARCHAR(64)     NOT NULL UNIQUE,
+  nickname     VARCHAR(32)     NOT NULL,
+  password_hash VARCHAR(255)   NOT NULL,
+  created_at   TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS game_servers (
+  server_id     INT UNSIGNED NOT NULL PRIMARY KEY,
+  name          VARCHAR(64)  NOT NULL,
+  ip            VARCHAR(64)  NOT NULL,
+  port          INT UNSIGNED NOT NULL,
+  current_users INT UNSIGNED NOT NULL DEFAULT 0,
+  max_users     INT UNSIGNED NOT NULL DEFAULT 0,
+  maintenance   TINYINT(1)   NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS characters (
+  character_id     BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  account_id       BIGINT UNSIGNED NOT NULL,
+  server_id        INT UNSIGNED    NOT NULL,
+  name             VARCHAR(32)     NOT NULL,
+  level            INT UNSIGNED    NOT NULL DEFAULT 1,
+  x                FLOAT           NOT NULL DEFAULT 0,
+  y                FLOAT           NOT NULL DEFAULT 0,
+  z                FLOAT           NOT NULL DEFAULT 0,
+  current_hp       INT             NOT NULL DEFAULT 100,
+  state_version    BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  state_updated_at TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+  created_at       TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY ux_characters_account_server (account_id, server_id),
+  CONSTRAINT fk_characters_account
+    FOREIGN KEY (account_id) REFERENCES accounts(account_id)
+    ON DELETE CASCADE,
+  CONSTRAINT fk_characters_server
+    FOREIGN KEY (server_id) REFERENCES game_servers(server_id)
+    ON DELETE CASCADE
+);
+```
+</Expandable>
+
+### accounts
+
+Stores one row per registered player.
+
+| Column | Type | Notes |
+|---|---|---|
+| `account_id` | `BIGINT UNSIGNED` | Auto-increment surrogate key |
+| `account_name` | `VARCHAR(64)` | Unique login name; 4–64 characters enforced by the AuthServer |
+| `nickname` | `VARCHAR(32)` | Display name; defaults to `account_name` when omitted at registration |
+| `password_hash` | `VARCHAR(255)` | PBKDF2-SHA256 hash produced by the AuthServer |
+| `created_at` | `TIMESTAMP` | Row insertion time, set by the database |
+
+### game\_servers
+
+Registry of game server instances the AuthServer exposes via `GET /servers`. The `maintenance` flag causes `POST /auth/select-server` to return HTTP 409.
+
+| Column | Type | Notes |
+|---|---|---|
+| `server_id` | `INT UNSIGNED` | Manual primary key matching `Config::GameServerId` in the C++ binary |
+| `name` | `VARCHAR(64)` | Human-readable server name shown in the client lobby |
+| `ip` | `VARCHAR(64)` | Publicly reachable IP or hostname of the game server |
+| `port` | `INT UNSIGNED` | TCP port the game server listens on |
+| `current_users` | `INT UNSIGNED` | Live player count (updated by the game server) |
+| `max_users` | `INT UNSIGNED` | Capacity ceiling displayed to clients |
+| `maintenance` | `TINYINT(1)` | `1` = server is in maintenance; `0` = accepting connections |
+
+### characters
+
+One row per (account, server) pair. A player gets exactly one character per game server, created automatically by `EnsureDefaultCharacterAsync` during server selection.
+
+| Column | Type | Notes |
+|---|---|---|
+| `character_id` | `BIGINT UNSIGNED` | Auto-increment surrogate key |
+| `account_id` | `BIGINT UNSIGNED` | FK → `accounts.account_id` (CASCADE DELETE) |
+| `server_id` | `INT UNSIGNED` | FK → `game_servers.server_id` (CASCADE DELETE) |
+| `name` | `VARCHAR(32)` | Character display name |
+| `level` | `INT UNSIGNED` | Current level, default 1 |
+| `x`, `y`, `z` | `FLOAT` | Last known world position in Unreal units |
+| `current_hp` | `INT` | Current hit points persisted by the bucket-save system |
+| `state_version` | `BIGINT UNSIGNED` | Monotonically increasing counter used for optimistic concurrency on character-state writes |
+| `state_updated_at` | `TIMESTAMP` | Automatically updated by MariaDB on every row change |
+
+---
+
+## 002\_inventory.sql — Inventory tables
+
+<Expandable title="002_inventory.sql — full source">
+```sql
+USE game;
+
+CREATE TABLE IF NOT EXISTS character_inventories (
+  character_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+  capacity     INT UNSIGNED    NOT NULL DEFAULT 40,
+  revision     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+                               ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT fk_character_inventories_character
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS item_instances (
+  item_instance_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  character_id     BIGINT UNSIGNED NOT NULL,
+  template_id      INT UNSIGNED    NOT NULL,
+  container_type   TINYINT UNSIGNED NOT NULL DEFAULT 1,
+  slot_index       INT UNSIGNED    NOT NULL,
+  quantity         INT UNSIGNED    NOT NULL,
+  durability       INT UNSIGNED    NOT NULL DEFAULT 0,
+  bind_flags       INT UNSIGNED    NOT NULL DEFAULT 0,
+  version          BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  created_at       TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at       TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                   ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY ux_item_instances_character_container_slot
+    (character_id, container_type, slot_index),
+  KEY ix_item_instances_character (character_id),
+  KEY ix_item_instances_template  (template_id),
+  CONSTRAINT chk_item_instances_quantity CHECK (quantity > 0),
+  CONSTRAINT fk_item_instances_character
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+    ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS inventory_operations (
+  operation_id      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  character_id      BIGINT UNSIGNED NOT NULL,
+  client_request_id BINARY(16)      NOT NULL,
+  operation_type    VARCHAR(32)     NOT NULL,
+  reason_code       VARCHAR(64)     NOT NULL,
+  item_instance_id  BIGINT UNSIGNED NULL,
+  quantity_delta    BIGINT          NOT NULL DEFAULT 0,
+  created_at        TIMESTAMP       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY ux_inventory_operations_character_request
+    (character_id, client_request_id),
+  KEY ix_inventory_operations_character_created (character_id, created_at),
+  CONSTRAINT fk_inventory_operations_character
+    FOREIGN KEY (character_id) REFERENCES characters(character_id)
+    ON DELETE CASCADE
+);
+```
+</Expandable>
+
+### character\_inventories
+
+Header record for each character's bag. The `revision` column is an **optimistic-concurrency counter**: every time any item in the inventory changes, the server increments `revision` atomically. Clients attach the last-known revision to mutating requests; the server rejects requests that arrive with a stale revision.
+
+| Column | Type | Notes |
+|---|---|---|
+| `character_id` | `BIGINT UNSIGNED` | 1-to-1 FK → `characters.character_id` |
+| `capacity` | `INT UNSIGNED` | Maximum number of slots; default 40 |
+| `revision` | `BIGINT UNSIGNED` | Incremented on every inventory change for optimistic locking |
+| `updated_at` | `TIMESTAMP` | Auto-updated by MariaDB |
+
+### item\_instances
+
+One row per item stack occupying a slot. The composite unique key `(character_id, container_type, slot_index)` guarantees no two items can occupy the same slot in the same container.
+
+| Column | Type | Notes |
+|---|---|---|
+| `item_instance_id` | `BIGINT UNSIGNED` | Surrogate key |
+| `character_id` | `BIGINT UNSIGNED` | Owner character |
+| `template_id` | `INT UNSIGNED` | FK → `item_templates.template_id` |
+| `container_type` | `TINYINT UNSIGNED` | Bag type identifier (e.g., `1` = main bag) |
+| `slot_index` | `INT UNSIGNED` | Zero-based slot position within the container |
+| `quantity` | `INT UNSIGNED` | Stack size; must be `> 0` (enforced by CHECK constraint) |
+| `durability` | `INT UNSIGNED` | Current durability value; `0` for non-degradable items |
+| `bind_flags` | `INT UNSIGNED` | Bit mask for bind-on-equip / bind-on-pickup state |
+| `version` | `BIGINT UNSIGNED` | Per-instance change counter |
+
+### inventory\_operations
+
+Append-only audit log. Each client request carries a `client_request_id` (16-byte UUID); the unique key on `(character_id, client_request_id)` makes operations idempotent — a duplicate submission returns the stored result instead of executing twice.
+
+| Column | Type | Notes |
+|---|---|---|
+| `operation_id` | `BIGINT UNSIGNED` | Auto-increment surrogate |
+| `client_request_id` | `BINARY(16)` | UUID supplied by the client for idempotency |
+| `operation_type` | `VARCHAR(32)` | Verb string, e.g., `"add"`, `"remove"`, `"move"` |
+| `reason_code` | `VARCHAR(64)` | Source of the change, e.g., `"quest_reward"`, `"shop_purchase"` |
+| `item_instance_id` | `BIGINT UNSIGNED` | Nullable reference to the affected item row |
+| `quantity_delta` | `BIGINT` | Signed quantity change (+add / −remove) |
+
+---
+
+## 003\_item\_templates.sql — Item definitions
+
+```sql
+USE game;
+
+CREATE TABLE IF NOT EXISTS item_templates (
+  template_id INT UNSIGNED NOT NULL PRIMARY KEY,
+  name        VARCHAR(100) NOT NULL,
+  max_stack   INT UNSIGNED NOT NULL DEFAULT 1,
+  usable      TINYINT(1)   NOT NULL DEFAULT 0,
+  CONSTRAINT chk_item_templates_max_stack CHECK (max_stack > 0)
+);
+```
+
+| Column | Type | Notes |
+|---|---|---|
+| `template_id` | `INT UNSIGNED` | Designer-assigned item type ID; referenced by `item_instances.template_id` |
+| `name` | `VARCHAR(100)` | Display name |
+| `max_stack` | `INT UNSIGNED` | Maximum units per inventory stack; must be `≥ 1` |
+| `usable` | `TINYINT(1)` | `1` if the item can be consumed/activated by the client |
+
+---
+
+## 004\_item\_effects.sql — Effect columns
+
+This migration extends `item_templates` with two columns that describe the outcome when a usable item is consumed.
+
+```sql
+USE game;
+
+ALTER TABLE item_templates
+  ADD COLUMN IF NOT EXISTS effect_type  TINYINT UNSIGNED NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS effect_value INT              NOT NULL DEFAULT 0;
+```
+
+| Column | Type | Notes |
+|---|---|---|
+| `effect_type` | `TINYINT UNSIGNED` | Numeric code for the effect category (e.g., `1` = restore HP) |
+| `effect_value` | `INT` | Magnitude of the effect (e.g., `30` = restore 30 HP) |
+
+---
+
+## 005\_character\_state.sql — State columns
+
+This migration adds three columns to `characters` that track live combat state between server restarts. The columns are already present in `001_schema.sql` for fresh deployments; this file exists to bring older schemas forward safely via `ADD COLUMN IF NOT EXISTS`.
+
+```sql
+USE game;
+
+ALTER TABLE characters
+  ADD COLUMN IF NOT EXISTS current_hp       INT             NOT NULL DEFAULT 100 AFTER z,
+  ADD COLUMN IF NOT EXISTS state_version    BIGINT UNSIGNED NOT NULL DEFAULT 0   AFTER current_hp,
+  ADD COLUMN IF NOT EXISTS state_updated_at TIMESTAMP       NOT NULL
+    DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP   AFTER state_version;
+```
+
+`state_version` is a monotonically increasing integer incremented by the C++ GameServer's bucket-save system every time a dirty character row is flushed. Batch writes use this value for optimistic concurrency: a flush is aborted if `state_version` in the database is higher than the value the server cached when it last read the row.

@@ -1,47 +1,208 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get the UE5 IOCP MMO Server Running Locally"
+sidebarTitle: "Quickstart"
+description: "Step-by-step guide to spinning up MariaDB, Redis, Prometheus, Grafana, the ASP.NET Core AuthServer, the C++ IOCP GameServer, and the UE5.4 client on a single Windows machine."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through every step needed to run all components of the UE5 IOCP MMO Server on a single Windows development machine — from cloning the repository and standing up the Docker infrastructure through launching the C++ game server and connecting with the Unreal Engine 5.4 client. The whole stack (excluding the Unreal Editor compile) should be up in under ten minutes.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you start, make sure all of the following are installed and working:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+<CardGroup cols={2}>
+  <Card title="Windows 10 / 11" icon="windows">
+    Required — the IOCP game server uses `WinSock2`, `MSWSock`, and Windows kernel completion-port APIs that do not exist on other platforms.
+  </Card>
+  <Card title="Visual Studio 2022" icon="code">
+    Open `ServerSolution/ServerSolution.sln`. The C++ project targets the MSVC toolset with Windows SDK headers for WinSock2 and MSWSock.
+  </Card>
+  <Card title=".NET 8 SDK" icon="terminal">
+    Required to build and run the ASP.NET Core AuthServer (`ServerSolution/AuthServer/`). Download from [dot.net](https://dot.net).
+  </Card>
+  <Card title="Docker Desktop" icon="docker">
+    Runs MariaDB 11, Redis 7, Prometheus, and Grafana as containers defined in `ServerSolution/Infra/docker-compose.yml`.
+  </Card>
+  <Card title="Unreal Engine 5.4" icon="gamepad">
+    Install via the Epic Games Launcher. The `.uproject` file pins `"EngineAssociation": "5.4"`.
+  </Card>
+  <Card title="protoc (optional)" icon="file-code">
+    Only needed if you modify `ServerSolution/ServerSolution/Proto/Packet.proto`. Install the Protocol Buffers compiler and regenerate both C++ and client stubs together.
+  </Card>
+</CardGroup>
 
-## Get started
+---
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the Repository and Open the Solution">
+    Clone the repository and open the Visual Studio solution:
 
     ```bash
-    npm install your-package
+    git clone https://github.com/kenzz55/ue5-iocp-mmo-server.git
+    cd ue5-iocp-mmo-server
+    ```
+
+    Open `ServerSolution/ServerSolution.sln` in Visual Studio 2022. The solution contains two projects:
+    - **ServerSolution** — the C++ IOCP game server
+    - **AuthServer** — the ASP.NET Core 8 auth service
+  </Step>
+
+  <Step title="Start the Infrastructure with Docker Compose">
+    The Docker Compose file at `ServerSolution/Infra/docker-compose.yml` defines MariaDB 11, Redis 7, Prometheus, and Grafana. It requires an `.env` file with secrets before it can start.
+
+    Copy the example file and fill in your passwords:
+
+    ```bash
+    cd ServerSolution/Infra
+    cp .env.example .env
+    ```
+
+    Edit `.env` with your chosen passwords:
+
+    ```bash
+    MARIADB_ROOT_PASSWORD=replace_with_a_strong_local_password
+    MARIADB_PASSWORD=replace_with_a_strong_local_password
+    GRAFANA_ADMIN_USER=admin
+    GRAFANA_ADMIN_PASSWORD=replace_with_a_strong_local_password
+    ```
+
+    Then bring the stack up:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    This starts four containers:
+
+    | Container | Port | Purpose |
+    |---|---|---|
+    | `serversolution-mariadb` | 3306 | Game database (auto-initialised from `mariadb/init/`) |
+    | `serversolution-redis` | 6379 | Token store |
+    | `serversolution-prometheus` | 9090 | Metrics collection (scrapes GameServer on :9108) |
+    | `serversolution-grafana` | 3000 | Dashboard UI (default user: `admin`) |
+
+    MariaDB schema migrations in `ServerSolution/Infra/mariadb/init/` are applied automatically on the first container start.
+  </Step>
+
+  <Step title="Configure and Run the AuthServer">
+    The AuthServer reads its database connection string and Redis address from `ServerSolution/AuthServer/appsettings.json`. Open the file and set the `Database.ConnectionString` to point at the MariaDB container:
+
+    ```json
+    {
+      "Database": {
+        "ConnectionString": "Server=127.0.0.1;Port=3306;Database=game;User=game;Password=replace_with_a_strong_local_password;"
+      },
+      "Redis": {
+        "Configuration": "127.0.0.1:6379"
+      },
+      "Tokens": {
+        "AccessTokenMinutes": 60,
+        "EnterTokenSeconds": 60,
+        "DuplicateLoginPolicy": "InvalidatePrevious"
+      },
+      "AllowedHosts": "*"
+    }
+    ```
+
+    Then run the AuthServer:
+
+    ```bash
+    cd ServerSolution/AuthServer
+    dotnet run
+    ```
+
+    By default the service listens on `http://localhost:5000`. Verify it is healthy:
+
+    ```bash
+    curl http://localhost:5000
+    # Expected: {"service":"AuthServer","status":"ok"}
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Configure and Build the C++ GameServer">
+    The GameServer reads database and Redis credentials from two INI files at startup. Copy the example files and fill in your values:
 
     ```bash
-    your-cli init
+    cd ServerSolution/ServerSolution
+    copy Database.example.ini Database.ini
+    copy Redis.example.ini Redis.ini
     ```
+
+    Edit **`Database.ini`**:
+
+    ```ini
+    # Copy to Database.ini and edit for your local MySQL server.
+    host=127.0.0.1
+    port=3306
+    user=game
+    password=replace_with_a_strong_local_password
+    database=game
+
+    # During local development, fallback keeps test/1234 working if MySQL is down.
+    # Set to false when you want DB failures to fail login immediately.
+    allow_dev_fallback=true
+    ```
+
+    Edit **`Redis.ini`**:
+
+    ```ini
+    host=127.0.0.1
+    port=6379
+    password=
+    database=0
+    allow_dev_fallback=false
+    ```
+
+    Back in Visual Studio 2022, set the **ServerSolution** project as the startup project, select the **Release | x64** configuration, and build (`Ctrl+Shift+B`). Then run `ServerSolution.exe` from the output directory (or press F5 from VS).
+
+    The server will log its bind addresses and begin accepting connections on TCP and UDP port 7777, and expose Prometheus metrics on port 9108.
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
 
-    ```bash
-    your-cli start
-    ```
+  <Step title="Open and Run the UE5 Client">
+    Open `MMOClient1/MMOClient1.uproject` with Unreal Engine 5.4. Unreal may prompt you to compile C++ modules — allow it.
+
+    Before hitting **Play In Editor**:
+
+    1. Locate the **`AuthClientSubsystem`** settings (or the relevant configuration asset/Blueprint variable).
+    2. Set the AuthServer URL to `http://localhost:5000`.
+    3. Ensure **`GameClientSubsystem`** is configured to connect to `127.0.0.1:7777` after a successful server selection.
+
+    Press **Play In Editor**. Use the in-game UI to register a new account, log in, select the local server, and enter the game world.
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+---
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+## Verification Checklist
+
+Once all components are running, confirm each service with these quick checks:
+
+```bash
+# AuthServer health
+curl http://localhost:5000
+# → {"service":"AuthServer","status":"ok"}
+
+# GameServer Prometheus health
+curl http://localhost:9108/health
+# → 200 OK
+
+# GameServer metrics
+curl http://localhost:9108/metrics
+# → Prometheus text-format metrics
+
+# Grafana dashboard
+# Open http://localhost:3000 in a browser (admin / your GRAFANA_ADMIN_PASSWORD)
+
+# Prometheus UI
+# Open http://localhost:9090 in a browser
+```
+
+---
+
+<Warning>
+  `allow_dev_fallback=true` in `Database.ini` enables a hardcoded fallback that accepts the credentials `test` / `1234` for login even when MariaDB is unreachable. This is a development convenience only. **Set `allow_dev_fallback=false` in any staging or production environment** to ensure database failures cause login to fail immediately rather than silently admitting unauthenticated sessions.
+</Warning>
+
+<Tip>
+  If you modify `ServerSolution/ServerSolution/Proto/Packet.proto`, you must regenerate both the C++ protobuf sources used by the game server and the corresponding client stubs used by `MMOClient1`. The client and server must always be in sync — a mismatch in field numbers or message names will cause silent deserialization failures at runtime.
 </Tip>

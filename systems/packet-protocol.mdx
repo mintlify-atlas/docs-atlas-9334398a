@@ -1,0 +1,247 @@
+---
+title: "Binary Packet Protocol: IDs, Header, and Protobuf"
+sidebarTitle: "Packet Protocol"
+description: "Full reference for the 4-byte binary header, every packet ID by range, Protobuf message schemas, the MoveBatchNotify binary layout, and the S_ErrorRes error code table."
+---
+
+Every TCP frame exchanged between client and server begins with a 4-byte fixed header followed by a variable-length payload encoded as a Protocol Buffers message. UDP datagrams for movement share the same header layout but use a custom packed binary payload for `MoveBatchNotify` rather than Protobuf, so the format is maximally compact inside a single datagram. `PacketHandlerRegistry` maps the 16-bit `packetId` directly to a handler via a flat 65,536-entry array, making dispatch O(1) with no hash computation.
+
+## Packet Header
+
+```cpp
+#pragma pack(push, 1)
+struct PacketHeader
+{
+    uint16 size     = 0;   // total frame size in bytes, including this header
+    uint16 packetId = 0;   // identifies the message type (PacketId enum)
+};
+#pragma pack(pop)
+
+static_assert(sizeof(PacketHeader) == 4);
+```
+
+`size` covers the full frame (header + payload). The receiver reads exactly `size` bytes, strips the 4-byte header, and passes the remainder to the appropriate Protobuf `ParseFromArray` call. The maximum accepted packet size is `MaxPacketSize = 16,384` bytes.
+
+## Packet ID Table
+
+### System Range — 0x0001–0x00FF
+
+| Constant            | ID     | Direction    | Description                                     |
+|---------------------|--------|--------------|-------------------------------------------------|
+| `PacketIdEchoReq`   | 0x0001 | C → S        | Echo request; payload echoed back verbatim       |
+| `PacketIdEchoRes`   | 0x0002 | S → C        | Echo response                                    |
+| `PacketIdErrorRes`  | 0x0003 | S → C        | Error response to any request; see `S_ErrorRes`  |
+| `PacketIdPing`      | 0x0004 | S → C        | Heartbeat ping with `HeartbeatPayload`           |
+| `PacketIdPong`      | 0x0005 | C → S        | Heartbeat reply                                  |
+
+### Auth Range — 0x0100–0x01FF
+
+<Note>
+All Auth-range packets are **deprecated**. Authentication, registration, server listing, and server selection are now served by the HTTPS AuthServer. The game server accepts these IDs for backward compatibility but the handlers return error responses. Use the HTTP AuthServer API and present the resulting `enter_token` in `C_EnterGameReq` instead.
+</Note>
+
+| Constant                  | ID     | Status     |
+|---------------------------|--------|------------|
+| `PacketIdLoginReq`        | 0x0101 | Deprecated |
+| `PacketIdLoginRes`        | 0x0102 | Deprecated |
+| `PacketIdRegisterReq`     | 0x0103 | Deprecated |
+| `PacketIdRegisterRes`     | 0x0104 | Deprecated |
+| `PacketIdServerListReq`   | 0x0111 | Deprecated |
+| `PacketIdServerListRes`   | 0x0112 | Deprecated |
+| `PacketIdSelectServerReq` | 0x0121 | Deprecated |
+| `PacketIdSelectServerRes` | 0x0122 | Deprecated |
+
+### Game Range — 0x0200–0x02FF
+
+| Constant                          | ID     | Direction | Description                                          |
+|-----------------------------------|--------|-----------|------------------------------------------------------|
+| `PacketIdEnterGameReq`            | 0x0201 | C → S     | Enter token + character selection                    |
+| `PacketIdEnterGameRes`            | 0x0202 | S → C     | Enter result; includes UDP token and port            |
+| `PacketIdSpawnMyCharacter`        | 0x0203 | S → C     | Spawns the local character after a successful enter  |
+| `PacketIdUdpHelloReq`             | 0x0204 | C → S UDP | Binds the client's UDP endpoint to its session       |
+| `PacketIdUdpHelloRes`             | 0x0205 | S → C UDP | Confirms UDP binding; includes `server_time_ms`      |
+| `PacketIdSpawnOtherCharacter`     | 0x0206 | S → C     | Notifies client that another player entered its AoI  |
+| `PacketIdDespawnCharacter`        | 0x0207 | S → C     | Notifies client that a player left its AoI           |
+| `PacketIdMoveReq`                 | 0x0211 | C → S UDP | Client movement input                                |
+| `PacketIdMoveNotify`              | 0x0212 | S → C     | Authoritative position update for a single character |
+| `PacketIdMoveBatchNotify`         | 0x0213 | S → C UDP | Batched movement update (binary layout, see below)   |
+| `PacketIdChatReq`                 | 0x0221 | C → S     | Chat message request                                 |
+| `PacketIdChatNtf`                 | 0x0222 | S → C     | Chat message broadcast                               |
+| `PacketIdAttackReq`               | 0x0231 | C → S     | Melee attack request                                 |
+| `PacketIdAttackAck`               | 0x0232 | S → C     | Attack acknowledgement                               |
+| `PacketIdAttackNotify`            | 0x0233 | S → C     | Notifies AoI peers of an attack                      |
+| `PacketIdSpawnMonster`            | 0x0241 | S → C     | Spawns a monster into the client's view              |
+| `PacketIdDespawnMonster`          | 0x0242 | S → C     | Removes a monster from the client's view             |
+| `PacketIdMonsterMoveNotify`       | 0x0243 | S → C     | Authoritative monster position update                |
+| `PacketIdEntityHpChanged`         | 0x0244 | S → C     | HP change for any entity (player or monster)         |
+| `PacketIdCombatDebugNotify`       | 0x0245 | S → C     | Debug info for player combat (dev builds only)       |
+| `PacketIdMonsterAttackNotify`     | 0x0246 | S → C     | Monster attack event for AoI observers               |
+| `PacketIdMonsterCombatDebugNotify`| 0x0247 | S → C     | Debug info for monster combat (dev builds only)      |
+| `PacketIdMonsterRangedShotNotify` | 0x0248 | S → C     | Ranged projectile start/end position                 |
+| `PacketIdInventorySnapshot`       | 0x0251 | S → C     | Full inventory state snapshot                        |
+| `PacketIdInventoryMoveReq`        | 0x0252 | C → S     | Move an item between slots                           |
+| `PacketIdInventoryOperationResult`| 0x0253 | S → C     | Result of an inventory operation with new snapshot   |
+| `PacketIdInventoryUseReq`         | 0x0254 | C → S     | Use an item from a slot                              |
+
+## Protobuf Message Schemas
+
+### Game Entry
+
+```protobuf
+message C_EnterGameReq {
+  string enter_token  = 1;  // JWT issued by HTTPS AuthServer
+  uint64 character_id = 2;
+}
+
+message S_EnterGameRes {
+  bool   success      = 1;
+  string message      = 2;
+  uint64 account_id   = 3;
+  uint64 character_id = 4;
+  string udp_token    = 5;  // used in C_UdpHelloReq to bind UDP endpoint
+  uint32 udp_port     = 6;  // UDP port to send movement datagrams to
+}
+```
+
+### Movement
+
+```protobuf
+message C_MoveReq {
+  uint32 input_sequence = 1;  // monotonically increasing per-client counter
+  float  move_x         = 2;  // normalised input direction X (-1..1)
+  float  move_y         = 3;  // normalised input direction Y (-1..1)
+  float  yaw            = 4;  // character facing angle in degrees
+  uint64 client_time_ms = 5;
+}
+
+message S_MoveNotify {
+  uint64 character_id                   = 1;
+  uint32 last_processed_input_sequence  = 2;  // client uses this to replay unacked inputs
+  float  x                              = 3;
+  float  y                              = 4;
+  float  z                              = 5;
+  float  velocity_x                     = 6;
+  float  velocity_y                     = 7;
+  float  velocity_z                     = 8;
+  float  yaw                            = 9;
+  uint64 server_time_ms                 = 10;
+}
+```
+
+### Combat
+
+```protobuf
+message C_AttackReq {
+  uint32 attack_sequence = 1;  // monotonically increasing per-client counter
+  uint32 combo_step      = 2;  // which hit in the combo chain (1-based)
+  uint64 client_time_ms  = 3;
+}
+
+message S_AttackAck {
+  bool   success         = 1;
+  string message         = 2;
+  uint32 attack_sequence = 3;
+  uint32 combo_step      = 4;
+  uint64 server_time_ms  = 5;
+}
+```
+
+### Inventory
+
+```protobuf
+message InventoryItem {
+  uint64 item_instance_id = 1;  // unique ID for this stack/item
+  uint32 template_id      = 2;  // item definition lookup key
+  uint32 quantity         = 3;
+  uint32 slot_index       = 4;
+  uint32 durability       = 5;
+}
+
+message S_InventorySnapshot {
+  bool                  success  = 1;
+  string                message  = 2;
+  uint64                revision = 3;   // optimistic-concurrency version
+  uint32                capacity = 4;   // total slot count
+  repeated InventoryItem items   = 5;
+}
+
+message C_InventoryMoveReq {
+  bytes  client_request_id  = 1;  // idempotency key chosen by client
+  uint64 expected_revision  = 2;  // rejected if server revision differs
+  uint64 item_instance_id   = 3;
+  uint32 source_slot        = 4;
+  uint32 destination_slot   = 5;
+  uint32 quantity           = 6;
+}
+
+message C_InventoryUseReq {
+  bytes  client_request_id = 1;
+  uint64 expected_revision = 2;
+  uint64 item_instance_id  = 3;
+  uint32 slot_index        = 4;
+}
+```
+
+`S_InventoryOperationResult` wraps a `client_request_id` echo and an embedded `S_InventorySnapshot` so the client can apply the new state atomically:
+
+```protobuf
+message S_InventoryOperationResult {
+  bool                success           = 1;
+  string              message           = 2;
+  bytes               client_request_id = 3;
+  S_InventorySnapshot snapshot          = 4;
+}
+```
+
+## MoveBatchNotify Binary Layout
+
+`PacketIdMoveBatchNotify` (0x0213) does **not** use Protobuf. It is a tightly packed binary structure sent over UDP for minimum per-entry overhead:
+
+```cpp
+#pragma pack(push, 1)
+struct MoveBatchNotifyHeader {
+    uint16 count        = 0;   // number of MoveBatchNotifyEntry records that follow
+    uint16 reserved     = 0;
+    uint64 serverTimeMs = 0;   // server timestamp when the batch was built
+};  // 12 bytes
+
+struct MoveBatchNotifyEntry {
+    uint64 characterId                  = 0;   // 8 bytes
+    uint32 lastProcessedInputSequence   = 0;   // 4 bytes
+    float  x                            = 0.f; // 4 bytes
+    float  y                            = 0.f;
+    float  z                            = 0.f;
+    float  velocityX                    = 0.f;
+    float  velocityY                    = 0.f;
+    float  velocityZ                    = 0.f;
+    float  yaw                          = 0.f;
+};  // 40 bytes
+#pragma pack(pop)
+
+static_assert(sizeof(MoveBatchNotifyHeader) == 12);
+static_assert(sizeof(MoveBatchNotifyEntry)  == 40);
+```
+
+With `MovementNotifyDatagramBytes = 1200` bytes per datagram, after accounting for the 4-byte `PacketHeader` and 12-byte `MoveBatchNotifyHeader`, each datagram carries at most **floor((1200 − 16) / 40) = 29** player entries.
+
+## Error Response
+
+`S_ErrorRes` is sent by the server whenever a request cannot be fulfilled:
+
+```protobuf
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED     = 0;
+  ERROR_CODE_MALFORMED_PACKET = 1;  // parse failure
+  ERROR_CODE_UNKNOWN_PACKET   = 2;  // no handler registered for packetId
+  ERROR_CODE_INVALID_DATA     = 3;  // valid parse but semantically wrong fields
+  ERROR_CODE_INVALID_STATE    = 4;  // operation not allowed in current SessionState
+  ERROR_CODE_AUTH_REQUIRED    = 5;  // session not authenticated
+  ERROR_CODE_RATE_LIMITED     = 6;  // MaxPacketsPerSecond exceeded
+}
+
+message S_ErrorRes {
+  uint32    request_packet_id = 1;  // echoes the packetId that caused the error
+  ErrorCode error_code        = 2;
+  string    message           = 3;
+}
+```

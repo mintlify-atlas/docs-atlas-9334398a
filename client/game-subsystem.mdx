@@ -1,0 +1,277 @@
+---
+title: "GameClientSubsystem: TCP/UDP Gameplay Connection"
+sidebarTitle: "Game Subsystem"
+description: "Complete reference for UGameClientSubsystem — the UGameInstanceSubsystem managing the TCP game server connection, UDP movement channel, packet dispatch, and all gameplay send/receive delegates."
+---
+
+`UGameClientSubsystem` is a `UGameInstanceSubsystem` that owns the client's live connection to the IOCP GameServer. It manages two sockets — a blocking TCP socket for reliable gameplay packets and a non-blocking UDP socket for high-frequency movement updates — and exposes a rich set of `BlueprintAssignable` delegates so that player controllers, character actors, and UI widgets can react to server-driven events without polling. All connection and enter-game I/O is performed on a background thread pool worker to avoid stalling the game thread.
+
+## Class declaration
+
+```cpp
+UCLASS()
+class MMOCLIENT1_API UGameClientSubsystem : public UGameInstanceSubsystem
+{
+    GENERATED_BODY()
+public:
+    // --- Delegates (all BlueprintAssignable) ---
+    FGameEnterResult              OnEnterGameResult;
+    FRemoteCharacterSpawned       OnRemoteCharacterSpawned;
+    FRemoteCharacterMoved         OnRemoteCharacterMoved;
+    FRemoteCharacterDespawned     OnRemoteCharacterDespawned;
+    FChatMessageReceived          OnChatMessageReceived;
+    FAttackAckReceived            OnAttackAckReceived;
+    FRemoteCharacterAttackStarted OnRemoteCharacterAttackStarted;
+    FMonsterSpawned               OnMonsterSpawned;
+    FMonsterDespawned             OnMonsterDespawned;
+    FMonsterMoved                 OnMonsterMoved;
+    FMonsterAttackStarted         OnMonsterAttackStarted;
+    FMonsterServerDebugChanged    OnMonsterServerDebugChanged;  // debug
+    FMyHealthChanged              OnMyHealthChanged;
+    FMonsterHealthChanged         OnMonsterHealthChanged;
+    FServerCombatDebugReceived    OnServerCombatDebugReceived;  // debug
+    FServerMonsterCombatDebugReceived OnServerMonsterCombatDebugReceived; // debug
+    FMonsterRangedShotReceived    OnMonsterRangedShotReceived;
+
+    // --- Connection ---
+    bool ConnectAndEnterGame(const FString& Host, int32 Port,
+                             const FString& EnterToken, int64 InCharacterId = 1);
+    void Disconnect();
+
+    // --- State queries ---
+    bool  IsConnected()    const;
+    bool  IsUdpReady()     const;
+    bool  HasEnteredGame() const;
+    int64 GetAccountId()   const;
+    int64 GetCharacterId() const;
+    FVector GetSpawnLocation()      const;
+    bool    HasServerMovement()     const;
+    FVector GetLastServerLocation() const;
+    float   GetLastServerYaw()      const;
+    FVector GetLastServerVelocity() const;
+    int32 GetMyCurrentHp() const;
+    int32 GetMyMaxHp()     const;
+
+    // --- Send ---
+    bool SendMoveInput(float MoveX, float MoveY, float Yaw);
+    bool SendChatMessage(const FString& Message);
+    bool SendAttackInput(int32 ComboStep);
+    bool SendInventoryMove(int32 SourceSlot, int32 DestinationSlot, int32 Quantity);
+    bool SendInventoryUse(int32 SlotIndex);
+
+    // --- Receive polling ---
+    void PollIncomingPackets();
+
+    // --- In-memory state ---
+    const TMap<int64, FRemoteCharacterState>& GetRemoteCharacters() const;
+    const TMap<int64, FMonsterState>&         GetMonsters()         const;
+};
+```
+
+## Connection flow
+
+The full entry sequence runs on a background thread via `Async(EAsyncExecution::ThreadPool, ...)` inside `ConnectAndEnterGame`, then marshals the result back to the game thread with `AsyncTask(ENamedThreads::GameThread, ...)`.
+
+<Steps>
+  <Step title="TCP connect">
+    A blocking `FTcpSocketBuilder` socket is created with 1 MB send and receive buffers and connected to `Host:Port`. If connection fails, `OnEnterGameResult` is broadcast with `bSuccess = false`.
+  </Step>
+  <Step title="Send C_EnterGameReq">
+    A `C_EnterGameReq` protobuf message containing the `EnterToken` and `CharacterId` is serialized and sent over TCP with a 4-byte `FGamePacketHeader` prefix (`Size`, `PacketId`).
+  </Step>
+  <Step title="Receive S_EnterGameRes">
+    The worker reads the response, which contains `account_id`, `character_id`, a `udp_token`, and a `udp_port`. Ping/pong heartbeat packets encountered while waiting are answered transparently.
+  </Step>
+  <Step title="Receive S_SpawnMyCharacter">
+    The worker reads the spawn packet which carries the character's initial world position `(x, y, z)`. This becomes `SpawnLocation` and `LastServerLocation`.
+  </Step>
+  <Step title="UDP hello handshake">
+    If `udp_port > 0` and `udp_token` is non-empty, a UDP socket is created and a `C_UdpHelloReq` is sent to `Host:udp_port`. The worker waits up to 5 seconds for an `S_UdpHelloRes`. On success, the socket is set to non-blocking and `bUdpReady` is set to `true`.
+  </Step>
+  <Step title="Game thread callback">
+    All sockets and state are moved to the subsystem on the game thread and `OnEnterGameResult` is broadcast with `bSuccess = true`.
+  </Step>
+</Steps>
+
+If any step fails, all sockets are destroyed, gameplay state is reset, and `OnEnterGameResult` is broadcast with `bSuccess = false`.
+
+## Methods
+
+### `ConnectAndEnterGame`
+
+Initiates the full asynchronous connection and enter-game sequence described above.
+
+<ParamField path="Host" type="FString" required>
+  IP address of the game server (obtained from `UAuthClientSubsystem::GetSelectedGameServerIp()`).
+</ParamField>
+
+<ParamField path="Port" type="int32" required>
+  TCP port of the game server (obtained from `UAuthClientSubsystem::GetSelectedGameServerPort()`).
+</ParamField>
+
+<ParamField path="EnterToken" type="FString" required>
+  Short-lived enter token issued by the AuthServer during `SelectServer`. Must be non-empty; the method returns `false` immediately if it is empty.
+</ParamField>
+
+<ParamField path="InCharacterId" type="int64">
+  The character ID to enter with. Defaults to `1`. Use `UAuthClientSubsystem::GetSelectedCharacterId()`.
+</ParamField>
+
+If another enter-game request is already in progress (`bEnterGameInProgress == true`), the method returns `true` without starting a second request. Calling `ConnectAndEnterGame` always calls `Disconnect()` first to clean up any previous connection.
+
+---
+
+### `Disconnect`
+
+Closes both the TCP and UDP sockets, cancels any in-flight enter-game request (by incrementing `EnterGameRequestId`), and resets all gameplay state including `RemoteCharacters`, `Monsters`, HP, and sequence counters. Also calls `UInventorySubsystem::ResetInventory()`.
+
+---
+
+### `SendMoveInput`
+
+Sends a `C_MoveReq` over **UDP**. Only sent if both `bEnteredGame` and `bUdpReady` are true.
+
+<ParamField path="MoveX" type="float" required>
+  Horizontal movement input axis value (typically `-1.0` to `1.0`).
+</ParamField>
+
+<ParamField path="MoveY" type="float" required>
+  Forward/backward movement input axis value.
+</ParamField>
+
+<ParamField path="Yaw" type="float" required>
+  Character facing angle in degrees.
+</ParamField>
+
+The packet includes an auto-incrementing `input_sequence` (starting at 1) and a `client_time_ms` timestamp. The server echoes back `last_processed_input_sequence` in `S_MoveNotify` for client-side reconciliation.
+
+---
+
+### `SendChatMessage`
+
+Sends a `C_ChatReq` over **TCP**. The message is trimmed of whitespace and rejected if empty or longer than 512 UTF-8 bytes.
+
+<ParamField path="Message" type="FString" required>
+  The chat message text to send.
+</ParamField>
+
+---
+
+### `SendAttackInput`
+
+Sends a `C_AttackReq` over **TCP**. `ComboStep` must be in the range 1–4; values outside this range are rejected with a warning log.
+
+<ParamField path="ComboStep" type="int32" required>
+  Which step in the combo chain this attack represents (1 through 4).
+</ParamField>
+
+The packet includes an auto-incrementing `attack_sequence` and a `client_time_ms` timestamp. The server replies with `S_AttackAck` carrying the same sequence number for correlation.
+
+---
+
+### `SendInventoryMove`
+
+Sends a `C_InventoryMoveReq` over **TCP** to move or split a stack of items between slots.
+
+<ParamField path="SourceSlot" type="int32" required>
+  Zero-based slot index of the item to move.
+</ParamField>
+
+<ParamField path="DestinationSlot" type="int32" required>
+  Zero-based destination slot index. Must differ from `SourceSlot`.
+</ParamField>
+
+<ParamField path="Quantity" type="int32" required>
+  Number of items to move. Must be `> 0` and `≤` the quantity in the source slot.
+</ParamField>
+
+The method validates slot bounds against `UInventorySubsystem::GetCapacity()` and confirms the source slot contains a matching item. A `FGuid` is generated for `client_request_id` and the current `UInventorySubsystem::GetRevision()` is sent as `expected_revision` for optimistic concurrency. The server's reply is `S_InventoryOperationResult`.
+
+---
+
+### `SendInventoryUse`
+
+Sends a `C_InventoryUseReq` over **TCP** to use (consume or equip) an item in a specific slot.
+
+<ParamField path="SlotIndex" type="int32" required>
+  Zero-based slot index of the item to use.
+</ParamField>
+
+Like `SendInventoryMove`, a `FGuid` client request ID and the current inventory revision are included for server-side validation.
+
+---
+
+### `PollIncomingPackets`
+
+Must be called once per game tick (typically from `AMCPlayerController::PlayerTick`). It drains pending data from both the TCP socket and the UDP socket, deserializes each packet header, and routes the body to `DispatchPacket`. If a TCP read fails, `Disconnect()` is called.
+
+## Packet receive dispatch
+
+`DispatchPacket(uint16 PacketId, const TArray<uint8>& Body)` is the central routing function. It handles all server-to-client packet IDs:
+
+| Packet ID constant | Hex | Action |
+|---|---|---|
+| `PacketIdPing` | `0x0004` | Replies with `PacketIdPong` immediately |
+| `PacketIdSpawnOtherCharacter` | `0x0206` | Parses `S_SpawnOtherCharacter`, updates `RemoteCharacters`, fires `OnRemoteCharacterSpawned` |
+| `PacketIdDespawnCharacter` | `0x0207` | Parses `S_DespawnCharacter`, removes from `RemoteCharacters`, fires `OnRemoteCharacterDespawned` |
+| `PacketIdMoveNotify` | `0x0212` | Parses `S_MoveNotify`, routes to `HandleMoveNotify` |
+| `PacketIdMoveBatchNotify` | `0x0213` | Unpacks binary batch header + entries, calls `HandleMoveNotify` per entry |
+| `PacketIdChatNtf` | `0x0222` | Parses `S_ChatNtf`, fires `OnChatMessageReceived` |
+| `PacketIdAttackAck` | `0x0232` | Parses `S_AttackAck`, fires `OnAttackAckReceived` |
+| `PacketIdAttackNotify` | `0x0233` | Reads binary `FAttackNotifyPayload`, fires `OnRemoteCharacterAttackStarted` (skipped for own character) |
+| `PacketIdSpawnMonster` | `0x0241` | Reads binary `FSpawnMonsterPayload`, updates `Monsters`, fires `OnMonsterSpawned` + `OnMonsterServerDebugChanged` |
+| `PacketIdDespawnMonster` | `0x0242` | Reads binary payload, removes from `Monsters`, fires `OnMonsterDespawned` |
+| `PacketIdMonsterMoveNotify` | `0x0243` | Reads binary `FMonsterMoveNotifyPayload`, fires `OnMonsterMoved` |
+| `PacketIdEntityHpChanged` | `0x0244` | Reads binary `FEntityHpChangedPayload`; routes to `OnMyHealthChanged` (player) or `OnMonsterHealthChanged` (monster) |
+| `PacketIdMonsterAttackNotify` | `0x0246` | Reads binary payload, fires `OnMonsterAttackStarted` |
+| `PacketIdInventorySnapshot` | `0x0251` | Decodes via custom protobuf wire reader, calls `UInventorySubsystem::ApplySnapshot` |
+| `PacketIdInventoryOperationResult` | `0x0253` | Decodes result + embedded snapshot, calls `ApplySnapshot` then `NotifyOperationCompleted` |
+| `PacketIdMonsterRangedShotNotify` | `0x0248` | Reads binary payload, fires `OnMonsterRangedShotReceived` |
+| `PacketIdCombatDebugNotify` | `0x0245` | Reads binary `FCombatDebugNotifyPayload`, fires `OnServerCombatDebugReceived` |
+| `PacketIdMonsterCombatDebugNotify` | `0x0247` | Reads binary payload, fires `OnServerMonsterCombatDebugReceived` |
+
+Movement batch packets (`PacketIdMoveBatchNotify`) use a tightly packed binary format (no protobuf) for bandwidth efficiency: a 12-byte header followed by 40-byte entries. Character spawn/despawn and chat use protobuf. Monster spawn/despawn/move also use a packed binary format with `static_assert` size guards.
+
+## Delegates
+
+```cpp
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+    FGameEnterResult, bool, bSuccess, const FString&, Message);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+    FRemoteCharacterSpawned, int64, CharacterId, FVector, Location, float, Yaw);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
+    FRemoteCharacterMoved,
+    int64, CharacterId, FVector, Location, FVector, Velocity, float, Yaw, int64, ServerTimeMs);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(
+    FRemoteCharacterDespawned, int64, CharacterId);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(
+    FChatMessageReceived,
+    int64, SenderId, const FString&, SenderName, const FString&, Message);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
+    FAttackAckReceived,
+    bool, bSuccess, int32, AttackSequence, int32, ComboStep, const FString&, Message);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_SevenParams(
+    FMonsterSpawned,
+    int64, MonsterId, int32, TemplateId, FVector, Location,
+    float, Yaw, int32, CurrentHp, int32, MaxHp, bool, bExisting);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
+    FMyHealthChanged,
+    int32, CurrentHp, int32, MaxHp, int32, DeltaHp, bool, bDead);
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(
+    FMonsterHealthChanged,
+    int64, MonsterId, int32, CurrentHp, int32, MaxHp, int32, DeltaHp, bool, bDead);
+```
+
+`AMCPlayerController` binds to all of these in `BeginPlay` and unbinds in `EndPlay`.
+
+<Note>
+`SendMoveInput` sends over **UDP** — it will silently drop the packet and return `false` if `bUdpReady` is `false`. This happens immediately after `ConnectAndEnterGame` completes if the UDP hello handshake failed (e.g. due to a firewall blocking the UDP port). All other send methods use the reliable TCP socket and will succeed as long as `HasEnteredGame()` is true. Check `IsUdpReady()` if you need to verify the movement channel is active.
+</Note>

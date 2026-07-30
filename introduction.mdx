@@ -1,0 +1,62 @@
+---
+title: "UE5 IOCP MMO Server: Real-Time Multiplayer Backend"
+sidebarTitle: "Introduction"
+description: "A production-ready Windows IOCP C++ game server paired with an ASP.NET Core auth service, MariaDB, Redis, and a UE5.4 client — built for large-scale MMO development."
+---
+
+The UE5 IOCP MMO Server is an end-to-end multiplayer backend designed for game developers building large-scale MMO experiences with Unreal Engine 5.4. It combines a high-performance C++ game server built on Windows I/O Completion Ports (IOCP) with a lightweight ASP.NET Core 8 authentication service, MariaDB 11 for persistent data, Redis 7 for token management, and Protocol Buffers for compact binary messaging. Whether you are prototyping a new MMO or studying production-grade server architecture, this project provides a complete, runnable reference implementation covering the full flow from player registration through real-time gameplay.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="IOCP Network Core" icon="server">
+    Windows I/O Completion Port networking supports up to 10,000 concurrent sessions. TCP carries reliable gameplay packets; UDP handles low-latency movement replication at a 100 ms notify interval.
+  </Card>
+  <Card title="Dedicated Auth Service" icon="lock">
+    An ASP.NET Core 8 minimal-API server owns registration, login, server listing, and server selection. It issues short-lived access tokens and enter tokens via Redis, keeping all auth logic out of the game server.
+  </Card>
+  <Card title="Area of Interest (AoI)" icon="eye">
+    A cell-based AoI system partitions the world using a configurable view distance of 3000 units. Players and monsters are only replicated to sessions within the relevant spatial cells, drastically reducing bandwidth.
+  </Card>
+  <Card title="Monster AI & Combat" icon="skull">
+    Server-authoritative monster entities support melee and ranged attack types with hit detection, HP tracking, death handling, and a 30-second respawn scheduler — all driven by the game simulation tick.
+  </Card>
+  <Card title="Inventory System" icon="box">
+    A durable inventory system persists item instances to MariaDB with optimistic concurrency via a revision counter. Move and use operations are idempotent and identified by client-generated request IDs.
+  </Card>
+  <Card title="Metrics & Monitoring" icon="chart-line">
+    The game server exposes a Prometheus HTTP endpoint on port 9108. A pre-configured Grafana dashboard visualises session counts, packet rates, tick timing, and inventory operation throughput in real time.
+  </Card>
+</CardGroup>
+
+## Technology Stack
+
+| Layer | Technology |
+|---|---|
+| Game Server | C++ (Windows IOCP, WinSock2, MSWSock) |
+| Auth Server | ASP.NET Core 8 (Minimal API) |
+| Database | MariaDB 11 |
+| Cache / Tokens | Redis 7 |
+| Serialisation | Protocol Buffers (proto3) |
+| Client | Unreal Engine 5.4 |
+| Observability | Prometheus + Grafana |
+
+## Key Configuration Constants
+
+The following compile-time constants from `Common/Config.h` and `Common/Types.h` govern the server's runtime behaviour. Adjust them before building to tune capacity and timing for your environment.
+
+| Constant | Value | Description |
+|---|---|---|
+| `ListenPort` | `7777` | TCP port the game server binds for gameplay connections |
+| `UdpListenPort` | `7777` | UDP port used for movement replication datagrams |
+| `MaxPacketSize` | `16 384 bytes` | Maximum permitted size of a single inbound TCP packet |
+| `MaxPacketsPerSecond` | `100` | Per-session rate limit before the connection is dropped |
+| `GameSimulationTickIntervalMs` | `33 ms` | Game loop tick interval (~30 Hz) |
+| `MovementAoiViewDistance` | `3000.0` | Spatial cell radius (UU) for player/monster visibility |
+| `HeartbeatIntervalSeconds` | `5 s` | How often the server sends a heartbeat ping |
+| `HeartbeatTimeoutSeconds` | `15 s` | Idle time before a session is forcibly disconnected |
+| `MAX_SESSIONS` | `10 000` | Hard cap on simultaneous connected sessions |
+
+<Note>
+  The game server uses `WinSock2`, `MSWSock`, and the Windows IOCP API (`CreateIoCompletionPort`, `AcceptEx`, `DisconnectEx`). It **cannot** be compiled or run on Linux or macOS without a significant rewrite. All server components are intended to be deployed on Windows Server or run locally on Windows 10/11.
+</Note>

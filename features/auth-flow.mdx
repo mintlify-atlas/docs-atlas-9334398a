@@ -1,0 +1,263 @@
+---
+title: "Authentication Flow: HTTP Login to TCP EnterGame"
+sidebarTitle: "Auth Flow"
+description: "Two-phase authentication: HTTP AuthServer issues access and enter tokens; the TCP game server validates them via Redis before admitting a session."
+---
+
+Authentication is split into two distinct phases. First, the client exchanges credentials with the **HTTP AuthServer** (ASP.NET Minimal API) to receive an `AccessToken` and, after selecting a game server, a short-lived `EnterToken`. Second, the client opens a TCP connection to the chosen game server and presents that `EnterToken` in a `C_EnterGameReq` packet. Only after the game server validates the token against Redis does it admit the session and assign a UDP port for positional updates.
+
+## Phase 1: HTTP AuthServer
+
+The AuthServer exposes four HTTP endpoints backed by MariaDB (account/character data) and Redis (token storage). All request and response bodies are JSON.
+
+### Endpoints
+
+<Steps>
+  <Step title="POST /auth/register">
+    Create a new account. The server hashes the password with `Pbkdf2PasswordHasher` (PBKDF2-SHA256, 210 000 iterations, 16-byte salt, 32-byte key) before storing it.
+
+    **Request body**
+    <ParamField body="Account" type="string" required>
+      4–64 characters.
+    </ParamField>
+    <ParamField body="Password" type="string" required>
+      8–128 characters.
+    </ParamField>
+    <ParamField body="Nickname" type="string">
+      2–32 characters. Defaults to the account name when omitted.
+    </ParamField>
+
+    **Response — `BasicResponse`**
+    <ResponseField name="Success" type="boolean">Whether the account was created.</ResponseField>
+    <ResponseField name="Message" type="string">Human-readable status string.</ResponseField>
+
+    Returns `400 Bad Request` for invalid field lengths and `409 Conflict` when the account name is already taken.
+
+    <CodeGroup>
+    ```bash curl
+    curl -X POST http://localhost:5000/auth/register \
+      -H "Content-Type: application/json" \
+      -d '{"Account":"alice","Password":"hunter2!","Nickname":"Alice"}'
+    ```
+    ```json Response (200)
+    { "success": true, "message": "register ok" }
+    ```
+    ```json Response (409)
+    { "success": false, "message": "duplicate account" }
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="POST /auth/login">
+    Validate credentials and receive an `AccessToken` stored in Redis with a TTL of `AccessTokenMinutes` (default 60 minutes).
+
+    **Request body**
+    <ParamField body="Account" type="string" required>
+      Registered account name.
+    </ParamField>
+    <ParamField body="Password" type="string" required>
+      Plain-text password; verified with constant-time PBKDF2 comparison.
+    </ParamField>
+
+    **Response — `AuthResponse`**
+    <ResponseField name="Success" type="boolean">Login outcome.</ResponseField>
+    <ResponseField name="AccountId" type="uint64">Numeric account identifier.</ResponseField>
+    <ResponseField name="AccessToken" type="string">64-character hex token; `null` on failure.</ResponseField>
+    <ResponseField name="Message" type="string">Status string.</ResponseField>
+
+    Returns `401 Unauthorized` for wrong credentials. When `DuplicateLoginPolicy` is `InvalidatePrevious` (default), any existing session token is revoked before issuing a new one; when `RejectNew`, the login is rejected with `409 Conflict` if an active session already exists.
+
+    <CodeGroup>
+    ```bash curl
+    curl -X POST http://localhost:5000/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{"Account":"alice","Password":"hunter2!"}'
+    ```
+    ```json Response (200)
+    {
+      "success": true,
+      "accountId": 1,
+      "accessToken": "a3f9...c1b2",
+      "message": "login ok"
+    }
+    ```
+    ```json Response (401)
+    {
+      "success": false,
+      "accountId": 0,
+      "accessToken": null,
+      "message": "invalid account or password"
+    }
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="GET /servers">
+    List all registered game servers. No authentication required.
+
+    **Response — array of `ServerDto`**
+    <ResponseField name="ServerId" type="uint32">Unique server identifier.</ResponseField>
+    <ResponseField name="Name" type="string">Display name.</ResponseField>
+    <ResponseField name="Ip" type="string">Public IP address.</ResponseField>
+    <ResponseField name="Port" type="uint32">TCP port.</ResponseField>
+    <ResponseField name="CurrentUsers" type="uint32">Current connected player count.</ResponseField>
+    <ResponseField name="MaxUsers" type="uint32">Capacity limit.</ResponseField>
+    <ResponseField name="Maintenance" type="boolean">When `true`, the server rejects new connections.</ResponseField>
+
+    <CodeGroup>
+    ```bash curl
+    curl http://localhost:5000/servers
+    ```
+    ```json Response (200)
+    [
+      {
+        "serverId": 1,
+        "name": "World 1",
+        "ip": "127.0.0.1",
+        "port": 7777,
+        "currentUsers": 12,
+        "maxUsers": 1000,
+        "maintenance": false
+      }
+    ]
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="POST /auth/select-server">
+    Exchange an `AccessToken` for a short-lived `EnterToken` (TTL = `EnterTokenSeconds`, default 60 seconds) bound to a specific server and character. The server creates a default character automatically if none exists for this account + server pair.
+
+    **Request body**
+    <ParamField body="AccessToken" type="string" required>
+      Token received from `POST /auth/login`.
+    </ParamField>
+    <ParamField body="ServerId" type="uint32" required>
+      Target server identifier from the server list.
+    </ParamField>
+
+    **Response — `SelectServerResponse`**
+    <ResponseField name="Success" type="boolean">Operation outcome.</ResponseField>
+    <ResponseField name="GameServerIp" type="string">IP address for the TCP game connection.</ResponseField>
+    <ResponseField name="GameServerPort" type="uint32">TCP port for the game connection.</ResponseField>
+    <ResponseField name="EnterToken" type="string">64-character hex token; valid for 60 seconds.</ResponseField>
+    <ResponseField name="CharacterId" type="uint64">Character to enter the world with.</ResponseField>
+    <ResponseField name="Message" type="string">Status string.</ResponseField>
+
+    Returns `401` for an invalid access token, `404` if the server ID does not exist, and `409` if the server is under maintenance.
+
+    <CodeGroup>
+    ```bash curl
+    curl -X POST http://localhost:5000/auth/select-server \
+      -H "Content-Type: application/json" \
+      -d '{"AccessToken":"a3f9...c1b2","ServerId":1}'
+    ```
+    ```json Response (200)
+    {
+      "success": true,
+      "gameServerIp": "127.0.0.1",
+      "gameServerPort": 7777,
+      "enterToken": "9d4e...3a01",
+      "characterId": 42,
+      "message": "select server ok"
+    }
+    ```
+    </CodeGroup>
+  </Step>
+</Steps>
+
+## Phase 2: TCP EnterGame
+
+Once the client has a TCP connection to the game server, it sends `C_EnterGameReq` (packet ID `0x0201`). The server calls `RedisTokenValidator::ValidateAndConsumeEnterToken()`, which atomically reads and deletes the `game:enter:<token>` key from Redis. Consuming the key on first use prevents replay attacks.
+
+**`C_EnterGameReq` — protobuf**
+
+```protobuf
+message C_EnterGameReq {
+  string enter_token = 1;
+  uint64 character_id = 2;
+}
+```
+
+**`S_EnterGameRes` — protobuf (packet ID `0x0202`)**
+
+```protobuf
+message S_EnterGameRes {
+  bool   success       = 1;
+  string message       = 2;
+  uint64 account_id    = 3;
+  uint64 character_id  = 4;
+  string udp_token     = 5;
+  uint32 udp_port      = 6;
+}
+```
+
+On success the server adds the player to `GameWorld`, loads inventory from MariaDB asynchronously, and pushes `S_InventorySnapshot` (0x0251) as soon as the load completes.
+
+## Phase 3: UDP Bind
+
+After receiving `S_EnterGameRes`, the client binds a UDP socket and sends `C_UdpHelloReq` (packet ID `0x0204`) to register its UDP endpoint with the server.
+
+**`C_UdpHelloReq` — protobuf**
+
+```protobuf
+message C_UdpHelloReq {
+  string udp_token    = 1;
+  uint64 account_id   = 2;
+  uint64 character_id = 3;
+}
+```
+
+**`S_UdpHelloRes` — protobuf (packet ID `0x0205`)**
+
+```protobuf
+message S_UdpHelloRes {
+  bool   success        = 1;
+  string message        = 2;
+  uint64 server_time_ms = 3;
+}
+```
+
+`server_time_ms` is used by the client to seed its clock-synchronisation baseline for movement prediction.
+
+## Token Storage
+
+| Token | Redis key pattern | TTL source | Default |
+|---|---|---|---|
+| AccessToken | `auth:access:<token>` | `TokenOptions.AccessTokenMinutes` | 60 min |
+| Session marker | `account:session:<accountId>` | same as AccessToken | 60 min |
+| EnterToken | `game:enter:<token>` | `TokenOptions.EnterTokenSeconds` | 60 s |
+
+The `DuplicateLoginPolicy` setting in `appsettings.json` controls what happens when a second login arrives for an already-authenticated account:
+
+```json appsettings.json (Tokens section)
+"Tokens": {
+  "AccessTokenMinutes": 60,
+  "EnterTokenSeconds": 60,
+  "DuplicateLoginPolicy": "InvalidatePrevious"
+}
+```
+
+- **`InvalidatePrevious`** (default) — the old `auth:access:<token>` key is deleted before issuing a new token.
+- **`RejectNew`** — if `account:session:<accountId>` exists the login returns `409 Conflict`.
+
+## Password Hashing
+
+Passwords are hashed by `Pbkdf2PasswordHasher` using RFC 2898 / PBKDF2 with SHA-256. The stored hash string has the format:
+
+```
+pbkdf2_sha256$<iterations>$<hex-salt>$<hex-key>
+```
+
+```csharp
+// Pbkdf2PasswordHasher constants
+private const string Prefix     = "pbkdf2_sha256";
+private const int    Iterations = 210_000;
+private const int    SaltSize   = 16;   // bytes
+private const int    KeySize    = 32;   // bytes
+```
+
+Verification uses `CryptographicOperations.FixedTimeEquals` to prevent timing-based enumeration of valid accounts.
+
+<Note>
+  The legacy TCP authentication packets — `C_LoginReq` (0x0101), `S_LoginRes` (0x0102), `C_RegisterReq` (0x0103), `S_RegisterRes` (0x0104), `C_ServerListReq` (0x0111), `S_ServerListRes` (0x0112), `C_SelectServerReq` (0x0121), `S_SelectServerRes` (0x0122) — are still declared in `Protocol.h` and `Packet.proto` for backward compatibility but are **not processed** by the game server. All authentication must go through the HTTP AuthServer.
+</Note>

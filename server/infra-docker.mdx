@@ -1,0 +1,204 @@
+---
+title: "Deploy Infrastructure with Docker Compose"
+sidebarTitle: "Docker Setup"
+description: "Stand up MariaDB, Redis, Prometheus, and Grafana for the MMO server stack using the provided Docker Compose file and environment variables."
+---
+
+The `ServerSolution/Infra/` directory contains a single `docker-compose.yml` that brings up the four infrastructure services the MMO server stack depends on: a MariaDB database, a Redis cache, a Prometheus metrics collector, and a Grafana dashboard. All services are configured through environment variables stored in a local `.env` file that is never committed to source control.
+
+<Warning>
+Never commit your `.env` file to the repository. It contains database root passwords and Grafana admin credentials. The file is listed in `.gitignore` by default — verify this before pushing.
+</Warning>
+
+## docker-compose.yml
+
+```yaml
+services:
+  mariadb:
+    image: mariadb:11
+    container_name: serversolution-mariadb
+    environment:
+      MARIADB_ROOT_PASSWORD: "${MARIADB_ROOT_PASSWORD:?Set MARIADB_ROOT_PASSWORD in ServerSolution/Infra/.env}"
+      MARIADB_DATABASE: game
+      MARIADB_USER: game
+      MARIADB_PASSWORD: "${MARIADB_PASSWORD:?Set MARIADB_PASSWORD in ServerSolution/Infra/.env}"
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./mariadb/init:/docker-entrypoint-initdb.d:ro
+      - mariadb-data:/var/lib/mysql
+
+  redis:
+    image: redis:7
+    container_name: serversolution-redis
+    ports:
+      - "6379:6379"
+
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    container_name: serversolution-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:13.1.1
+    container_name: serversolution-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_ADMIN_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in ServerSolution/Infra/.env}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  mariadb-data:
+  prometheus-data:
+  grafana-data:
+```
+
+## Environment variables
+
+Create `ServerSolution/Infra/.env` by copying `.env.example` and replacing every placeholder value with a strong password. The Compose file uses the `:?` syntax, which causes `docker compose` to abort with a descriptive error if a required variable is missing or empty.
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `MARIADB_ROOT_PASSWORD` | ✅ Yes | _(none)_ | Password for the MariaDB `root` superuser. Used only for administrative access — the application connects as the `game` user. |
+| `MARIADB_PASSWORD` | ✅ Yes | _(none)_ | Password for the `game` database user. Must match the `password` field in the GameServer's `Database.ini` and the `ConnectionString` in the AuthServer's `appsettings.json`. |
+| `GRAFANA_ADMIN_USER` | No | `admin` | Username for the initial Grafana administrator account. Defaults to `admin` if not set. |
+| `GRAFANA_ADMIN_PASSWORD` | ✅ Yes | _(none)_ | Password for the Grafana administrator account. Grafana will refuse to start if this is unset. |
+
+## Services
+
+| Service | Container name | Published port | Purpose |
+|---|---|---|---|
+| `mariadb` | `serversolution-mariadb` | `3306` | Relational database holding accounts, characters, inventory, and item data |
+| `redis` | `serversolution-redis` | `6379` | Token store for the AuthServer; also used by the GameServer for session tokens |
+| `prometheus` | `serversolution-prometheus` | `9090` | Scrapes the GameServer's `/metrics` endpoint (port `9108`) every 15 s and retains 15 days of time-series data |
+| `grafana` | `serversolution-grafana` | `3000` | Visualization front-end pre-provisioned with dashboards from `monitoring/grafana/dashboards/` |
+
+## Volume mounts
+
+| Volume | Mounted inside | Description |
+|---|---|---|
+| `mariadb-data` | `/var/lib/mysql` | Persistent MariaDB data directory; survives container recreation |
+| `prometheus-data` | `/prometheus` | Prometheus TSDB storage; 15-day rolling retention |
+| `grafana-data` | `/var/lib/grafana` | Grafana state: dashboards, user preferences, and alert rules |
+
+The `./mariadb/init` host directory is mounted read-only to `/docker-entrypoint-initdb.d`. MariaDB executes every `.sql` file in that directory in lexicographic order on the first startup of a fresh volume, applying the full schema automatically.
+
+## Initial setup
+
+<Steps>
+  <Step title="Copy and configure .env">
+    Navigate to the `Infra` directory and create your environment file from the example:
+
+    ```bash
+    cd ServerSolution/Infra
+    cp .env.example .env
+    ```
+
+    Open `.env` in an editor and replace all `replace_with_a_strong_local_password` placeholders with real passwords:
+
+    ```bash
+    MARIADB_ROOT_PASSWORD=MyStr0ng_R00t_P@ss!
+    MARIADB_PASSWORD=MyStr0ng_Game_P@ss!
+    GRAFANA_ADMIN_USER=admin
+    GRAFANA_ADMIN_PASSWORD=MyStr0ng_Graf@na!
+    ```
+  </Step>
+
+  <Step title="Start all services">
+    Bring up the full stack in detached mode:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    On the first run, Docker will pull the four images and MariaDB will execute the `001`–`005` init scripts. This typically takes 20–40 seconds.
+  </Step>
+
+  <Step title="Verify the stack">
+    Confirm all containers are healthy:
+
+    ```bash
+    docker compose ps
+    ```
+
+    Expected output shows all four services with status `Up` or `running`:
+
+    ```
+    NAME                        IMAGE                        STATUS
+    serversolution-grafana      grafana/grafana:13.1.1       Up
+    serversolution-mariadb      mariadb:11                   Up (healthy)
+    serversolution-prometheus   prom/prometheus:v3.13.0      Up
+    serversolution-redis        redis:7                      Up
+    ```
+  </Step>
+
+  <Step title="Update configuration files">
+    Set `MARIADB_PASSWORD` in the GameServer's `Database.ini` and in the AuthServer's `appsettings.json` `ConnectionString` to match the value you chose in step 1:
+
+    ```ini
+    # Database.ini
+    host=127.0.0.1
+    port=3306
+    user=game
+    password=MyStr0ng_Game_P@ss!
+    database=game
+    allow_dev_fallback=false
+    ```
+
+    ```json
+    "Database": {
+      "ConnectionString": "Server=127.0.0.1;Port=3306;Database=game;User=game;Password=MyStr0ng_Game_P@ss!;"
+    }
+    ```
+  </Step>
+</Steps>
+
+## Selective startup
+
+You do not need the monitoring stack running to develop locally. Start only the database and cache with:
+
+```bash
+docker compose up -d mariadb redis
+```
+
+When you are ready to examine metrics, add Prometheus and Grafana without restarting the data services:
+
+```bash
+docker compose up -d prometheus grafana
+```
+
+To stop everything without removing volumes:
+
+```bash
+docker compose stop
+```
+
+To tear down containers and delete all persistent volumes (destructive — loses all database data):
+
+```bash
+docker compose down -v
+```
+
+<Tip>
+Grafana is pre-provisioned with dashboards from `monitoring/grafana/dashboards/`. Open `http://localhost:3000` and log in with the `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` credentials you set in `.env`. The GameServer Prometheus endpoint is at `http://localhost:9108/metrics`.
+</Tip>

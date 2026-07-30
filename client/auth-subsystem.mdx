@@ -1,0 +1,244 @@
+---
+title: "AuthClientSubsystem: HTTP Login and Server Select"
+sidebarTitle: "Auth Subsystem"
+description: "Full reference for UAuthClientSubsystem — the UGameInstanceSubsystem that handles HTTP register, login, server list, and server selection against the ASP.NET Core AuthServer."
+---
+
+`UAuthClientSubsystem` is a `UGameInstanceSubsystem` that owns every interaction with the ASP.NET Core AuthServer. It is responsible for registering and authenticating accounts, fetching the list of available game servers, selecting a server to play on, and storing the resulting tokens and connection details that `UGameClientSubsystem` needs to open a TCP game connection. No IOCP GameServer communication is performed by this class — that boundary is enforced by design.
+
+## Class declaration
+
+```cpp
+UCLASS()
+class MMOCLIENT1_API UAuthClientSubsystem : public UGameInstanceSubsystem
+{
+    GENERATED_BODY()
+public:
+    UPROPERTY(BlueprintAssignable, Category = "Auth")
+    FAuthClientResult OnRegisterResult;
+
+    UPROPERTY(BlueprintAssignable, Category = "Auth")
+    FAuthClientResult OnLoginResult;
+
+    UPROPERTY(BlueprintAssignable, Category = "Auth")
+    FAuthServerListResult OnServerListResult;
+
+    UPROPERTY(BlueprintAssignable, Category = "Auth")
+    FAuthSelectServerResult OnSelectServerResult;
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    void SetAuthServerBaseUrl(const FString& InBaseUrl);
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    bool Register(const FString& Account, const FString& Password, const FString& Nickname);
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    bool Login(const FString& Account, const FString& Password);
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    bool RequestServerList();
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    bool SelectServer(int32 ServerId);
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    bool SelectDefaultServer();
+
+    UFUNCTION(BlueprintCallable, Category = "Auth")
+    void ClearLocalSession();
+
+    // BlueprintPure getters: IsLoggedIn, GetAccessToken, GetEnterToken,
+    // GetSelectedCharacterId, GetSelectedGameServerIp,
+    // GetSelectedGameServerPort, GetCachedServerList
+};
+```
+
+The default `AuthServerBaseUrl` is `http://127.0.0.1:5000`. Change it at runtime with `SetAuthServerBaseUrl` before making any requests, or configure it via `EditAnywhere` in the Blueprint defaults.
+
+## HTTP request internals
+
+All requests are made through Unreal's `FHttpModule`. JSON POST requests are sent via the private helper `SendJsonRequest`, and GET requests via `SendGetRequest`. Both helpers:
+
+1. Build the full URL by concatenating `AuthServerBaseUrl` and a route string (e.g. `/auth/login`).
+2. Create a request via `FHttpModule::Get().CreateRequest()`.
+3. Set `Accept: application/json` and `Content-Type: application/json`.
+4. Attach a completion delegate that is invoked on the game thread when the response arrives.
+5. Call `ProcessRequest()` and return its success flag.
+
+If `ProcessRequest()` returns `false`, the corresponding `OnXxxResult` delegate is broadcast immediately with `bSuccess = false`.
+
+## Methods
+
+### `Register`
+
+Creates a new player account on the AuthServer.
+
+<ParamField path="Account" type="FString" required>
+  The player's account identifier (typically an email address).
+</ParamField>
+
+<ParamField path="Password" type="FString" required>
+  The desired account password.
+</ParamField>
+
+<ParamField path="Nickname" type="FString" required>
+  The in-game display name for the new account.
+</ParamField>
+
+**HTTP request:**
+
+```json
+POST /auth/register
+{
+  "account": "player@example.com",
+  "password": "secret",
+  "nickname": "PlayerOne"
+}
+```
+
+**Response handling:** The JSON response is parsed for `success` (bool) and `message` (string). The result is broadcast on `OnRegisterResult(bSuccess, Message)`. Registration does **not** store an access token — a separate login call is required.
+
+---
+
+### `Login`
+
+Authenticates an existing account and stores the returned `accessToken`.
+
+<ParamField path="Account" type="FString" required>
+  The registered account identifier.
+</ParamField>
+
+<ParamField path="Password" type="FString" required>
+  The account password.
+</ParamField>
+
+**HTTP request:**
+
+```json
+POST /auth/login
+{
+  "account": "player@example.com",
+  "password": "secret"
+}
+```
+
+**Response handling:** On success, the `accessToken` field is extracted from the JSON response and stored in the private `AccessToken` member. On failure, `AccessToken`, `EnterToken`, `SelectedGameServerIp`, and `SelectedGameServerPort` are all cleared. The result is broadcast on `OnLoginResult(bSuccess, Message)`.
+
+---
+
+### `RequestServerList`
+
+Fetches the list of available game servers. No authentication header is required — the server list is publicly accessible.
+
+**HTTP request:**
+
+```
+GET /servers
+```
+
+**Response handling:** The response body is a JSON array. Each element is parsed into an `FAuthServerInfo` struct:
+
+```cpp
+USTRUCT(BlueprintType)
+struct FAuthServerInfo
+{
+    int32  ServerId;
+    FString Name;
+    FString Ip;
+    int32  Port;
+    int32  CurrentUsers;
+    int32  MaxUsers;
+    bool   bMaintenance;
+};
+```
+
+The parsed array is stored in `CachedServerList` and broadcast on `OnServerListResult(bSuccess, Servers)`. If parsing fails, `CachedServerList` is left empty.
+
+---
+
+### `SelectServer`
+
+Exchanges the stored `AccessToken` and a `ServerId` for a short-lived `EnterToken`, plus the game server IP and port.
+
+<ParamField path="ServerId" type="int32" required>
+  The `ServerId` of the server to connect to, as returned by `RequestServerList`.
+</ParamField>
+
+**Precondition:** `AccessToken` must be non-empty (i.e. `Login` must have succeeded). If it is empty, `OnSelectServerResult` is broadcast immediately with `bSuccess = false` and the message `"login required"`.
+
+**HTTP request:**
+
+```json
+POST /auth/select-server
+{
+  "accessToken": "<jwt>",
+  "serverId": 1
+}
+```
+
+**Response handling:** On success, the following fields are extracted and stored:
+
+| JSON field | Stored in |
+|---|---|
+| `gameServerIp` | `SelectedGameServerIp` |
+| `gameServerPort` | `SelectedGameServerPort` |
+| `enterToken` | `EnterToken` |
+| `characterId` | `SelectedCharacterId` |
+
+On failure, all four fields are reset to empty/zero. The result is broadcast on `OnSelectServerResult(bSuccess, GameServerIp, GameServerPort, EnterToken, CharacterId, Message)`.
+
+---
+
+### `SelectDefaultServer`
+
+Convenience wrapper that calls `SelectServer` with the first non-maintenance server from `CachedServerList`. If `CachedServerList` is empty or all servers are in maintenance, it broadcasts `OnSelectServerResult` with `bSuccess = false` and `"no available server"`.
+
+---
+
+### `ClearLocalSession`
+
+Resets all stored session state: `AccessToken`, `EnterToken`, `SelectedGameServerIp`, `SelectedGameServerPort`, `SelectedCharacterId`, and `CachedServerList`. Call this on logout or when returning to the login screen.
+
+## Stored state
+
+After a successful `Login` → `RequestServerList` → `SelectServer` sequence, the following accessors return valid values:
+
+| Accessor | Type | Description |
+|---|---|---|
+| `GetAccessToken()` | `FString` | JWT used to authenticate subsequent AuthServer requests |
+| `GetEnterToken()` | `FString` | Short-lived token passed to `GameClientSubsystem::ConnectAndEnterGame` |
+| `GetSelectedGameServerIp()` | `FString` | IP address of the chosen game server |
+| `GetSelectedGameServerPort()` | `int32` | TCP port of the chosen game server |
+| `GetSelectedCharacterId()` | `int64` | Character ID associated with the selected server slot |
+| `GetCachedServerList()` | `TArray<FAuthServerInfo>` | All servers returned by the last `RequestServerList` call |
+| `IsLoggedIn()` | `bool` | Returns `true` when `AccessToken` is non-empty |
+
+## Delegates
+
+```cpp
+// Fired by Register and Login
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+    FAuthClientResult,
+    bool, bSuccess,
+    const FString&, Message);
+
+// Fired by RequestServerList
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
+    FAuthServerListResult,
+    bool, bSuccess,
+    const TArray<FAuthServerInfo>&, Servers);
+
+// Fired by SelectServer / SelectDefaultServer
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_SixParams(
+    FAuthSelectServerResult,
+    bool, bSuccess,
+    const FString&, GameServerIp,
+    int32, GameServerPort,
+    const FString&, EnterToken,
+    int64, CharacterId,
+    const FString&, Message);
+```
+
+<Tip>
+Always call `SelectServer` (or `SelectDefaultServer`) **before** calling `UGameClientSubsystem::ConnectAndEnterGame`. The game subsystem requires the `EnterToken`, `SelectedGameServerIp`, and `SelectedGameServerPort` that are only available after a successful `SelectServer` response. `ALoginPlayerController` retrieves them via `GetAuthSubsystem()->GetEnterToken()` and friends inside its `HandleSelectServerResult` callback.
+</Tip>

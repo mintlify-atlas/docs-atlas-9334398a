@@ -1,0 +1,126 @@
+---
+title: "Configure the C++ IOCP GameServer"
+sidebarTitle: "GameServer Config"
+description: "Set up Database.ini, Redis.ini, and understand every compile-time constant in Config.h before running the C++ IOCP GameServer."
+---
+
+The C++ IOCP GameServer reads two runtime configuration files — `Database.ini` and `Redis.ini` — before opening its listen socket. Everything else that shapes server behavior is baked into `Common/Config.h` as `constexpr` values and takes effect only after a recompilation. This page documents both layers so you can tune the server for your environment without hunting through header files.
+
+## Database.ini
+
+Copy `Database.example.ini` to `Database.ini` in the same directory as the server binary and fill in your MySQL/MariaDB credentials. The file is excluded from source control by `.gitignore`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `host` | string | `127.0.0.1` | Hostname or IP address of the MySQL/MariaDB server |
+| `port` | integer | `3306` | TCP port the database listens on |
+| `user` | string | `game` | Database user the server authenticates as |
+| `password` | string | `game_password` | Password for the database user |
+| `database` | string | `game` | Schema/database name to connect to |
+| `allow_dev_fallback` | bool | `true` | When `true`, a hardcoded `test` / `1234` credential pair remains valid even if the database is unreachable. Set to `false` in any environment beyond local development. |
+
+```ini
+# Database.ini
+host=127.0.0.1
+port=3306
+user=game
+password=s3cur3_g@me_pass
+database=game
+allow_dev_fallback=false
+```
+
+## Redis.ini
+
+Copy `Redis.example.ini` to `Redis.ini` in the same directory as the server binary.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `host` | string | `127.0.0.1` | Hostname or IP address of the Redis server |
+| `port` | integer | `6379` | TCP port Redis listens on |
+| `password` | string | _(empty)_ | AUTH password; leave blank if Redis has no password set |
+| `database` | integer | `0` | Redis logical database index (0–15) |
+| `allow_dev_fallback` | bool | `false` | When `true`, Redis connectivity failures are tolerated during development. Keep `false` in production. |
+
+```ini
+# Redis.ini
+host=127.0.0.1
+port=6379
+password=r3d1s_s3cr3t
+database=0
+allow_dev_fallback=false
+```
+
+## Compile-time constants (Config.h)
+
+All values below live in the `Config` namespace inside `ServerSolution/Common/Config.h`. Changing any of them requires a full rebuild of the server binary.
+
+<Warning>
+These constants are evaluated at compile time. Modifying `Config.h` without recompiling the project has no effect on a running or previously built binary.
+</Warning>
+
+### Network
+
+| Constant | Value | Description |
+|---|---|---|
+| `ListenPort` | `7777` | TCP port the server accepts gameplay connections on |
+| `UdpListenPort` | `7777` | UDP port used for low-latency movement datagrams |
+| `BufferSize` | `4096` | Default I/O buffer size per operation (bytes) |
+| `MaxPacketSize` | `16384` | Maximum allowed size of a single received packet (16 KiB) |
+| `RecvBufferSize` | `131072` | Per-session receive ring-buffer size (128 KiB) |
+| `SendBufferSize` | `65536` | Per-session send buffer size (64 KiB) |
+| `InitialSessionPoolSize` | `1024` | Number of session objects pre-allocated in the pool at startup |
+| `WORKER_THREAD_COUNT` | `4` | Number of IOCP worker threads servicing completion packets |
+
+### Session limits
+
+| Constant | Value | Description |
+|---|---|---|
+| `MaxPacketsPerSecond` | `100` | Per-session inbound packet rate limit; excess packets are dropped |
+| `MaxChatMessageLength` | `512` | Maximum character length of a single chat message payload |
+| `HeartbeatIntervalSeconds` | `5` | How often the server expects a heartbeat from each client (seconds) |
+| `HeartbeatTimeoutSeconds` | `15` | Seconds without a heartbeat before a session is forcibly closed |
+| `MAX_SESSIONS` | `10000` | Hard upper bound on simultaneous connected sessions |
+
+### Game simulation
+
+| Constant | Value | Description |
+|---|---|---|
+| `GameSimulationTickIntervalMs` | `33` | Simulation tick period in milliseconds (~30 Hz) |
+| `MaxGameSimulationCommandQueueSize` | `65536` | Maximum number of pending simulation commands buffered before backpressure is applied |
+
+### Movement
+
+| Constant | Value | Description |
+|---|---|---|
+| `MovementAoiViewDistance` | `3000.0` | Area-of-Interest radius for broadcasting movement updates (Unreal units) |
+| `MovementNotifyIntervalMs` | `100` | Minimum interval between movement-notification dispatches per entity (ms) |
+| `MovementMaxWalkSpeed` | `500.0` | Maximum authoritative walk speed used in server-side movement validation (Unreal units/s) |
+| `MovementMaxAcceleration` | `800.0` | Maximum authoritative acceleration (Unreal units/s²) |
+
+### Persistence
+
+| Constant | Value | Description |
+|---|---|---|
+| `CharacterStateSaveBucketCount` | `10` | Number of time-slice buckets that spread dirty-character flushes across the save interval |
+| `CharacterStateSaveBucketIntervalSeconds` | `1.0` | Duration of each save bucket in seconds; total save cycle = `BucketCount × BucketInterval` (10 s) |
+| `CharacterStateDbBatchSize` | `100` | Maximum number of character rows written to the database in a single batch flush |
+
+### Metrics
+
+| Constant | Value | Description |
+|---|---|---|
+| `EnablePerfMetrics` | `true` | Master switch for the performance metrics subsystem |
+| `EnablePerfCsvLog` | `true` | Write rolling performance metrics to `Logs/perf_metrics.csv` |
+| `PerfLogIntervalSeconds` | `5` | How often a metrics snapshot is recorded (seconds) |
+| `EnablePrometheusEndpoint` | `true` | Expose a Prometheus `/metrics` HTTP endpoint |
+| `PrometheusHttpPort` | `9108` | Port the embedded Prometheus HTTP listener binds to |
+
+## Port summary
+
+| Port | Protocol | Purpose |
+|---|---|---|
+| `7777` | TCP | Client gameplay connections (IOCP session layer) |
+| `7777` | UDP | Low-latency movement datagram channel |
+| `9108` | HTTP (TCP) | Prometheus `/metrics` scrape endpoint |
+
+Ensure your firewall or cloud security group allows inbound TCP and UDP on 7777 from game clients, and restricts port 9108 to your Prometheus scraper only.

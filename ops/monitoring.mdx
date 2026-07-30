@@ -1,0 +1,189 @@
+---
+title: "Server Monitoring: Prometheus and Grafana"
+sidebarTitle: "Monitoring"
+description: "Configure the built-in Prometheus metrics endpoint and bring up the Grafana dashboard stack to observe your MMO GameServer in real time."
+---
+
+The GameServer exposes a Prometheus text-format metrics endpoint at `http://localhost:9108/metrics` and a liveness check at `http://localhost:9108/health`. A pre-configured Docker Compose stack in `ServerSolution/Infra/` pairs Prometheus (scraping every 5 seconds) with Grafana, which auto-provisions the **MMO / MMO GameServer Overview** dashboard on startup.
+
+## MetricsHttpServer
+
+The HTTP server is controlled by two constants in `Config.h`:
+
+```cpp
+constexpr bool EnablePrometheusEndpoint = true;
+constexpr uint16 PrometheusHttpPort     = 9108;
+```
+
+When `EnablePrometheusEndpoint` is `true` the server starts a lightweight single-threaded TCP listener on `PrometheusHttpPort` before the IOCP loop begins. The two endpoints it serves are:
+
+| Path | Method | Description |
+|------|--------|-------------|
+| `/metrics` | `GET` | Prometheus text format — all `NetworkMetrics::Snapshot` fields |
+| `/health` | `GET` | Returns `200 OK` with body `ok` |
+
+### Verify the endpoint
+
+```powershell
+Invoke-WebRequest -UseBasicParsing http://localhost:9108/health
+Invoke-WebRequest -UseBasicParsing http://localhost:9108/metrics
+```
+
+## Starting the monitoring stack
+
+<Steps>
+  <Step title="Build and start the GameServer">
+    Make sure the GameServer process is running before starting the containers. The Prometheus scrape job targets `host.docker.internal:9108`, so the endpoint must be reachable from Docker.
+  </Step>
+  <Step title="Set the Grafana admin password">
+    The `GRAFANA_ADMIN_PASSWORD` variable is required by the Compose file — it has no built-in default in production mode.
+
+    ```powershell
+    $env:GRAFANA_ADMIN_PASSWORD = "your-password"
+    ```
+  </Step>
+  <Step title="Start Prometheus and Grafana">
+    Run the following from the `ServerSolution/Infra/` directory:
+
+    ```powershell
+    cd ServerSolution\Infra
+    docker compose up -d prometheus grafana
+    ```
+
+    The Compose file pins exact image versions (`prom/prometheus:v3.13.0`, `grafana/grafana:13.1.1`) and mounts the provisioning files as read-only volumes so the dashboard is always present on a clean start.
+  </Step>
+  <Step title="Open the dashboards">
+    | Service | URL |
+    |---------|-----|
+    | Prometheus targets | `http://localhost:9090/targets` |
+    | Grafana | `http://localhost:3000` |
+
+    Log in to Grafana with user `admin` and the password set above. The **MMO / MMO GameServer Overview** dashboard is pre-loaded in the `MMO` folder.
+  </Step>
+</Steps>
+
+## NetworkMetrics.Snapshot fields
+
+The `/metrics` response is derived from `NetworkMetrics::Snapshot`. The fields are grouped below by subsystem.
+
+<Accordion title="Connection counts">
+
+| Field | Description |
+|-------|-------------|
+| `connectedSessions` | Total TCP sessions currently connected |
+| `authenticatedSessions` | Sessions that have completed login |
+| `udpBoundSessions` | Sessions that have completed UDP hello handshake |
+
+</Accordion>
+
+<Accordion title="TCP receive / send">
+
+| Field | Description |
+|-------|-------------|
+| `recvBytes` | Cumulative bytes received over TCP |
+| `recvPackets` | Cumulative TCP packets received |
+| `sendPackets` | Cumulative TCP packets sent |
+| `sendCalls` | Number of `WSASend` calls made |
+| `scatterGatherSendCalls` | `WSASend` calls that used scatter-gather buffers |
+
+</Accordion>
+
+<Accordion title="UDP">
+
+| Field | Description |
+|-------|-------------|
+| `udpRecvPackets` | Cumulative UDP datagrams received |
+| `udpRecvBytes` | Cumulative UDP bytes received |
+| `udpSendPackets` | Cumulative UDP datagrams sent |
+| `udpSendBytes` | Cumulative UDP bytes sent |
+| `udpSendFailures` | UDP send calls that returned an error |
+
+</Accordion>
+
+<Accordion title="Movement commands">
+
+| Field | Description |
+|-------|-------------|
+| `moveReqReceived` | `C_MoveReq` UDP packets received |
+| `moveCommandsQueued` | Commands enqueued to the simulation queue |
+| `moveCommandsDropped` | Commands dropped because the queue was full |
+| `moveCommandsApplied` | Commands processed by the simulation tick |
+| `moveCommandsStale` | Commands discarded because a newer input arrived first |
+| `moveNotifyPackets` | `S_MoveNotify` packets sent |
+| `moveNotifyRecipients` | Total recipient count across all notify packets |
+| `movementBatchPackets` | `S_MoveBatchNotify` packets sent |
+| `movementBatchEntries` | Total entries across all batch notify packets |
+
+</Accordion>
+
+<Accordion title="Movement replication">
+
+| Field | Description |
+|-------|-------------|
+| `movementReplicationPublished` | Position snapshots published to the replication buffer |
+| `movementReplicationDispatched` | Snapshots dispatched to clients in a replication cycle |
+| `movementReplicationPending` | Snapshots currently waiting to be dispatched |
+| `movementReplicationCycleTotalMicros` | Cumulative microseconds spent in replication cycles |
+
+</Accordion>
+
+<Accordion title="Game simulation">
+
+| Field | Description |
+|-------|-------------|
+| `gameSimulationTicks` | Number of simulation ticks completed |
+| `gameSimulationOverBudgetTicks` | Ticks that exceeded the 33 ms budget |
+| `gameSimulationTickTotalMicros` | Cumulative tick wall-clock time in microseconds |
+| `gameSimulationTickMaxMicros` | Slowest single tick in microseconds |
+| `missedTicks` | Ticks skipped because the previous tick ran too long |
+
+</Accordion>
+
+<Accordion title="Job queue">
+
+| Field | Description |
+|-------|-------------|
+| `jobQueued` | Session jobs enqueued |
+| `jobDropped` | Session jobs dropped because `MaxSessionJobQueueSize` (1024) was exceeded |
+
+</Accordion>
+
+<Accordion title="Process">
+
+| Field | Description |
+|-------|-------------|
+| `processCpuPercent` | Process-level CPU utilisation (0–100 ×  core count) |
+| `processWorkingSetBytes` | Working set (physical memory) of the process |
+| `processPrivateBytes` | Private committed memory |
+| `processHandleCount` | Open OS handle count |
+| `processThreadCount` | Active thread count |
+
+</Accordion>
+
+<Accordion title="Logging">
+
+| Field | Description |
+|-------|-------------|
+| `logDropped` | Log events dropped because the async queue was full |
+
+</Accordion>
+
+## CSV metrics log
+
+In addition to the Prometheus endpoint, the server writes a rolling CSV log controlled by:
+
+```cpp
+constexpr bool EnablePerfCsvLog        = true;
+constexpr int  PerfLogIntervalSeconds  = 5;
+constexpr const char* PerfCsvLogPath   = "Logs/perf_metrics.csv";
+```
+
+When `EnablePerfCsvLog` is `true` a new row is appended every 5 seconds. This file is the primary input for the [PerformanceReport tool](/ops/performance).
+
+<Tip>
+  Watch `gameSimulationOverBudgetTicks` and `missedTicks` as your primary at-a-glance health signals. A single non-zero `missedTicks` reading means the simulation loop fell a full 33 ms behind — investigate `gameSimulationTickMaxMicros` and per-phase timings first before tuning thread counts.
+</Tip>
+
+<Note>
+  Docker Desktop's Prometheus container reaches the Windows host via `host.docker.internal:9108`. If the **Target** shows `DOWN` on `http://localhost:9090/targets`, confirm that the GameServer is running and that Windows Firewall allows inbound TCP on port **9108**.
+</Note>

@@ -1,0 +1,121 @@
+---
+title: "Server-Side Game Simulation Tick Loop"
+sidebarTitle: "Game Simulation"
+description: "How the single-threaded GameSimulation loop runs at 30 Hz, drains a lock-free command queue each tick, executes six ordered phases, and exposes latency histograms for Grafana."
+---
+
+The server's authoritative game state lives inside a single-threaded simulation loop. All network threads—IOCP workers receiving UDP movement inputs, TCP packet handlers processing attacks and inventory operations—submit work by enqueuing `Command` lambdas into a thread-safe queue. The simulation thread wakes on each 33 ms tick, drains the command queue, then advances game state through six ordered phases. Because only the simulation thread ever mutates `GameWorld`, no additional locks are needed on the game objects themselves.
+
+## GameSimulation Class
+
+```cpp
+class GameSimulation
+{
+public:
+    using Command     = std::function<void()>;
+    using TickFunction = std::function<void(float)>;  // float = deltaSeconds
+
+    bool Start(
+        std::chrono::milliseconds tickInterval,  // Config::GameSimulationTickIntervalMs = 33
+        std::size_t maxPendingCommands,          // Config::MaxGameSimulationCommandQueueSize = 65536
+        TickFunction tickFunction);
+
+    void Stop();
+
+    bool Enqueue(Command command);          // non-blocking; returns false if queue full
+    bool EnqueueAndWait(Command command);   // blocks caller until command executes
+    MetricsSnapshot TakeMetricsSnapshot();
+};
+```
+
+`Start()` launches the simulation thread and arms a high-resolution timer (Windows `timeBeginPeriod(1)` on supported builds) to improve sleep accuracy near the 33 ms boundary. `Stop()` signals the thread and waits for it to exit, executing any remaining commands before returning.
+
+## Command Queue
+
+Commands are stored as `TimedCommand` structs that capture both the callable and the time the command was enqueued:
+
+```cpp
+struct TimedCommand {
+    std::chrono::steady_clock::time_point queuedAt{};
+    Command execute;
+};
+std::deque<TimedCommand> commands_;   // protected by commandMutex_
+```
+
+| Config constant                       | Value   | Meaning                                         |
+|---------------------------------------|---------|-------------------------------------------------|
+| `MaxGameSimulationCommandQueueSize`   | 65,536  | Commands dropped (metric: `commandsDrained`) beyond this |
+| `GameSimulationTickIntervalMs`        | 33      | Target tick period (≈ 30 Hz)                    |
+
+`Enqueue()` acquires `commandMutex_`, pushes the `TimedCommand`, and signals `wakeCondition_` to unblock the simulation thread if it is sleeping. `EnqueueAndWait()` additionally blocks the calling thread on a second condition variable until the command lambda returns, which is useful for synchronous queries from external threads.
+
+## Tick Phases
+
+Each tick the simulation executes six ordered phases. The phases are defined in `NetworkMetrics::GameSimulationPhase` and measured individually for Prometheus:
+
+```cpp
+enum class GameSimulationPhase : std::size_t
+{
+    CharacterStateSave,    // snapshot dirty player states → persistence queue
+    PlayerMovement,        // step movement for all active movers
+    PlayerCombat,          // resolve pending player attack hits
+    MonsterCombat,         // resolve pending monster attack hits
+    MonsterSimulation,     // advance monster AI state machines
+    MonsterNotifications,  // broadcast monster position / attack events to AoI observers
+    Count
+};
+```
+
+<Accordion title="Phase details">
+
+**CharacterStateSave** — Calls `GameWorld::TakeDirtyPlayerStates()` with a rotating bucket index (`characterStateSaveBucketIndex_`) so the 1,024-session pool is spread across `CharacterStateSaveBucketCount = 10` buckets. Each bucket is saved every `CharacterStateSaveBucketIntervalSeconds = 1.0 s`.
+
+**PlayerMovement** — Iterates `activeMoveSessions_` and calls `Session::StepMovement(deltaSeconds)` for each session that has a pending move input. `StepMovement` integrates velocity using Config.h physics constants (`MaxWalkSpeed`, `MaxAcceleration`, `BrakingDeceleration`, `GroundFriction`) and returns an updated `MovementSnapshot` that is then published to `MovementReplication`.
+
+**PlayerCombat** — Resolves `pendingAttacks_` whose start time plus animation offset has elapsed. Performs a capsule sweep in `GameWorld::ApplyDamageToMonstersInSweep()` and broadcasts `S_EntityHpChanged` to AoI observers.
+
+**MonsterCombat** — Resolves `pendingMonsterAttacks_` using the stored `hitDelaySeconds`. Applies damage to the target player via `GameWorld::ApplyDamageToPlayer()`.
+
+**MonsterSimulation** — Calls `GameWorld::StepMonsters(deltaSeconds, outAttacks)`. Monster AI runs a simple state machine: `Idle → Chase → RangedAttack / MeleeAttack → Return`. New attack events are collected in `outAttacks` and pushed into `pendingMonsterAttacks_` for the next combat phase.
+
+**MonsterNotifications** — Accumulates `monsterSnapshotAccumulator_`. When it exceeds `MonsterAoiRefreshIntervalSeconds = 0.2 s`, calls `RefreshMonsterAoi()` to update observer lists and broadcast `PacketIdMonsterMoveNotify` to each watcher.
+
+</Accordion>
+
+## Metrics and Latency Buckets
+
+`GameSimulation::MetricsSnapshot` exposes counters that are periodically transferred to `NetworkMetrics` for Prometheus export:
+
+```cpp
+struct MetricsSnapshot {
+    std::size_t pendingCommands;       // queue depth at snapshot time
+    std::size_t pendingCommandsMax;    // high-water mark since last snapshot
+    std::size_t commandsDrained;       // commands executed since last snapshot
+    std::size_t commandWaitSamples;    // number of command wait measurements
+    std::size_t commandWaitTotalMicros;
+    std::size_t commandWaitMaxMicros;
+    std::array<std::size_t, 10> commandWaitBuckets;  // histogram buckets
+    std::size_t missedTicks;           // ticks where sleep overran by > tickInterval
+    std::size_t tickLatenessMaxMicros; // worst-case tick start delay
+    ...
+};
+```
+
+**Command wait buckets** measure the time a command spends in the queue before the simulation thread drains it. The bucket upper bounds (in microseconds) are:
+
+```cpp
+inline static constexpr std::array<std::size_t, 10> CommandWaitBucketUpperBoundsMicros{
+    100, 500, 1'000, 2'000, 5'000, 10'000, 20'000, 33'000, 100'000,
+    static_cast<std::size_t>(-1)   // overflow / unbounded bucket
+};
+```
+
+A command arriving in the last bucket (> 100 ms wait) indicates that the simulation thread is falling behind the network thread rate.
+
+<Note>
+Network threads (IOCP workers) **enqueue** commands; they never read or write `GameWorld` directly. Only the simulation thread calls `GameWorld` mutation methods. This single-writer design means `GameWorld` reads from the simulation thread need no locks, and concurrent reads from other threads use only `std::shared_mutex` for snapshot operations.
+</Note>
+
+<Tip>
+Watch the `missedTicks` counter in Grafana as a first-pass performance signal. A missed tick means the OS woke the simulation thread more than 33 ms late—usually caused by system-wide CPU saturation or timer resolution degradation. Over-budget tick time is tracked separately in `gameSimulationOverBudgetTicks` and reports ticks where the six phases collectively exceeded the 33 ms budget.
+</Tip>

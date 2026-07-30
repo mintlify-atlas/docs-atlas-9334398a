@@ -1,0 +1,230 @@
+---
+title: "Combat System and Server-Side Monster AI"
+sidebarTitle: "Combat & Monsters"
+description: "Server-authoritative combat with sweep-based hit detection, HP tracking, knockback physics, and a state-machine monster AI with ranged and melee attacks."
+---
+
+Combat is entirely server-authoritative. When a player swings, the client sends a lightweight intent packet; the server performs a capsule-sweep hit test against all monsters in the area, applies damage and knockback, and broadcasts the results to every client in the Area of Interest (AoI). Monster AI runs as part of the game-simulation tick (every 33 ms by default) inside `GameWorld::StepMonsters()`, advancing a per-monster state machine that transitions between idle patrolling, chasing, attacking, and returning to the spawn point.
+
+## Player Attack Flow
+
+<Steps>
+  <Step title="C_AttackReq (0x0231) — client sends attack intent">
+    The client sends this packet when the player initiates an attack. No hit information is included; the server computes all hits independently.
+
+    ```protobuf
+    message C_AttackReq {
+      uint32 attack_sequence = 1;
+      uint32 combo_step      = 2;
+      uint64 client_time_ms  = 3;
+    }
+    ```
+
+    <ParamField body="attack_sequence" type="uint32" required>
+      Monotonically increasing counter per session; used to detect dropped or out-of-order attack packets.
+    </ParamField>
+    <ParamField body="combo_step" type="uint32" required>
+      Current step in the combo chain (1-indexed). The server tracks `lastComboStep` on `PlayerEntity` to validate sequencing.
+    </ParamField>
+    <ParamField body="client_time_ms" type="uint64" required>
+      Client-side timestamp; stored for latency logging and debug packets.
+    </ParamField>
+  </Step>
+
+  <Step title="S_AttackAck (0x0232) — server acknowledges">
+    Sent back to the attacking client only. The client uses `server_time_ms` to calibrate its lag-compensated animation.
+
+    ```protobuf
+    message S_AttackAck {
+      bool   success         = 1;
+      string message         = 2;
+      uint32 attack_sequence = 3;
+      uint32 combo_step      = 4;
+      uint64 server_time_ms  = 5;
+    }
+    ```
+  </Step>
+
+  <Step title="Hit detection — ApplyDamageToMonstersInSweep">
+    After acknowledging the attack, the server calls `GameWorld::ApplyDamageToMonstersInSweep()` to determine which monsters were struck. The sweep is a capsule test along the player's facing direction.
+
+    ```cpp
+    // GameWorld.h
+    std::vector<HpChange> ApplyDamageToMonstersInSweep(
+        EntityId attackerId,
+        float    sweepStartX,
+        float    sweepStartY,
+        float    sweepEndX,
+        float    sweepEndY,
+        float    sweepRadius,
+        std::size_t maxTargets,
+        int32    damage,
+        float    knockbackDistance);
+    ```
+
+    For each monster hit, a `HpChange` result is produced and packaged into `S_EntityHpChanged`.
+  </Step>
+
+  <Step title="S_AttackNotify (0x0233) — broadcast to AoI peers">
+    Broadcast to all players within AoI of the attacker so they can play the attack animation on the correct character.
+  </Step>
+
+  <Step title="S_EntityHpChanged (0x0244) — HP update">
+    Sent to all AoI observers whenever a hit lands on a monster (or a monster hits a player).
+
+    <ResponseField name="entity_type" type="EntityType">Player or Monster.</ResponseField>
+    <ResponseField name="entity_id" type="uint64">Entity that was hit.</ResponseField>
+    <ResponseField name="current_hp" type="int32">HP after this change.</ResponseField>
+    <ResponseField name="max_hp" type="int32">Maximum HP of the entity.</ResponseField>
+    <ResponseField name="delta_hp" type="int32">Negative for damage, positive for healing.</ResponseField>
+    <ResponseField name="dead" type="bool">`true` if the entity's HP reached 0.</ResponseField>
+  </Step>
+</Steps>
+
+## MonsterEntity
+
+Each live monster is represented by a `MonsterEntity` struct held inside `GameWorld`. The fields below are the most operationally significant:
+
+```cpp
+// Game/GameWorld.h
+struct MonsterEntity
+{
+    EntityId id          = 0;
+    uint32 spawnPointId  = 0;
+    uint32 templateId    = 0;
+
+    // Position and velocity
+    float x = 0.0f, y = 0.0f, z = 0.0f;
+    float yaw = 0.0f;
+    float spawnX = 0.0f, spawnY = 0.0f, spawnZ = 0.0f;
+    float velocityX = 0.0f, velocityY = 0.0f, velocityZ = 0.0f;
+
+    // Movement parameters
+    float moveSpeed       = 250.0f;
+    float detectionRadius = 600.0f;
+    float leashRadius     = 1500.0f;
+
+    // Attack range parameters
+    float rangedAttackRadius = 400.0f;
+    float meleeAttackRadius  = 140.0f;
+
+    // Cooldowns (seconds)
+    float rangedAttackCooldownSeconds = 1.5f;
+    float meleeAttackCooldownSeconds  = 1.0f;
+
+    // Attack animation timing
+    float rangedAttackActionSeconds   = 40.0f / 30.0f;  // ~1.33 s
+    float meleeAttackActionSeconds    = 38.0f / 30.0f;  // ~1.27 s
+    float rangedAttackHitSeconds      = 17.0f / 30.0f;  // ~0.57 s
+    float meleeAttackHitSeconds       = 13.0f / 30.0f;  // ~0.43 s
+
+    // Damage
+    int32 rangedAttackDamage = 10;
+    int32 meleeAttackDamage  = 10;
+
+    // Knockback on hit
+    float knockbackDistance        = 60.0f;
+    float knockbackDurationSeconds = 0.18f;
+
+    // Hit reaction
+    float hitReactionDurationSeconds = 30.0f / 30.0f;  // 1.0 s
+
+    // HP
+    int32 currentHp = 100;
+    int32 maxHp     = 100;
+
+    // AI state
+    EntityId       targetEntityId = 0;
+    MonsterAiState aiState        = MonsterAiState::Idle;
+    uint32         attackSequence = 0;
+};
+```
+
+## Monster AI State Machine
+
+The `MonsterAiState` enum drives every monster's behaviour each simulation tick:
+
+```cpp
+enum class MonsterAiState : uint8
+{
+    Idle        = 0,
+    Chase       = 1,
+    RangedAttack = 2,
+    Return      = 3,
+    MeleeAttack = 4
+};
+```
+
+<CardGroup cols={2}>
+  <Card title="Idle → Chase" icon="eye">
+    When a player enters `detectionRadius` (600 units) the monster picks that player as its target and transitions to **Chase**, beginning to move toward them at `moveSpeed` (250 units/s).
+  </Card>
+  <Card title="Chase → RangedAttack" icon="crosshairs">
+    While chasing, if the player is within `rangedAttackRadius` (400 units) and the ranged cooldown has expired, the monster transitions to **RangedAttack**. It plays the ranged attack animation (`rangedAttackActionSeconds ≈ 1.33 s`) and deals `rangedAttackDamage` (10) at the hit frame (`rangedAttackHitSeconds ≈ 0.57 s`).
+  </Card>
+  <Card title="Chase → MeleeAttack" icon="sword">
+    If the player is within `meleeAttackRadius` (140 units) the monster transitions to **MeleeAttack**. The melee animation takes `meleeAttackActionSeconds ≈ 1.27 s` with the hit at `meleeAttackHitSeconds ≈ 0.43 s` dealing `meleeAttackDamage` (10).
+  </Card>
+  <Card title="Chase → Return" icon="rotate-left">
+    If the monster moves farther than `leashRadius` (1500 units) from its spawn point, it abandons its target and transitions to **Return**, moving back to `(spawnX, spawnY, spawnZ)`.
+  </Card>
+  <Card title="Return → Idle" icon="house">
+    When the monster reaches within `MonsterReturnArrivalTolerance` (1 unit) of the spawn point it transitions back to **Idle** and clears its target.
+  </Card>
+  <Card title="RangedAttack / MeleeAttack → Chase" icon="repeat">
+    After the attack action completes (`attackActionRemainingSeconds` reaches 0) the monster returns to **Chase** to re-evaluate range.
+  </Card>
+</CardGroup>
+
+**Attack types**
+
+```cpp
+enum class MonsterAttackType : uint8
+{
+    Ranged = 1,
+    Melee  = 2
+};
+```
+
+## AoI Broadcasting
+
+All monster events are broadcast only to players within the configured AoI (`MonsterAoiViewDistance`, which equals `MovementAoiViewDistance` = 3000 units). AoI membership is refreshed every `MonsterAoiRefreshIntervalSeconds` (0.2 s).
+
+| Packet ID | Name | Trigger |
+|---|---|---|
+| 0x0241 | `S_SpawnMonster` | Monster enters a player's AoI |
+| 0x0242 | `S_DespawnMonster` | Monster leaves a player's AoI or is dead |
+| 0x0243 | `S_MonsterMoveNotify` | Position update during Chase/Return |
+| 0x0244 | `S_EntityHpChanged` | Any HP change (player or monster) |
+| 0x0246 | `S_MonsterAttackNotify` | Melee attack started |
+| 0x0248 | `S_MonsterRangedShotNotify` | Ranged projectile fired |
+
+## Knockback and Hit Reaction
+
+When a player's sweep hits a monster the server applies knockback using the following parameters from `MonsterEntity`:
+
+| Parameter | Value |
+|---|---|
+| `knockbackDistance` | 60 units |
+| `knockbackDurationSeconds` | 0.18 s |
+| `hitReactionDurationSeconds` | 30/30 = 1.0 s |
+
+During `hitReactionRemainingSeconds > 0` the monster is in a stunned state and cannot initiate new attacks. Knockback movement is resolved by the server and broadcast via `S_MonsterMoveNotify`.
+
+## Monster Respawn
+
+When a monster's HP reaches 0, the server removes it from `GameWorld`, broadcasts `S_DespawnMonster` to all observers, and schedules a respawn after `MonsterRespawnDelaySeconds` (30 s). After the delay the monster is re-created at its original spawn point (identified by `spawnPointId`) with full HP and `aiState = Idle`.
+
+```cpp
+// Common/Config.h
+constexpr int MonsterRespawnDelaySeconds = 30;
+```
+
+<Note>
+  Setting `EnableCombatDebugPackets = true` in `Common/Config.h` (the compiled-in default) causes the server to emit two additional packets per attack event:
+
+  - **0x0245 `S_CombatDebugNotify`** — sent to the attacking player; includes sweep geometry (start/end/radius), the list of hit monster IDs, and the server-computed damage values.
+  - **0x0247 `S_MonsterCombatDebugNotify`** — broadcast to all AoI observers; includes the monster's AI state, target ID, and current cooldown timers at the moment of the attack.
+
+  Disable this flag for production builds to reduce per-frame bandwidth.
+</Note>

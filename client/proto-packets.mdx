@@ -1,0 +1,364 @@
+---
+title: "Protobuf Packets Used by the UE5 MMO Client"
+sidebarTitle: "Packet Reference"
+description: "Complete reference for all Protocol Buffer messages sent and received by the UE5 MMOClient1, with field types, packet IDs, and proto regeneration instructions."
+---
+
+The UE5 client shares the same `Packet.proto` definition as the C++ GameServer. The generated C++ files live in `MMOClient1/Source/MMOClient1/Proto/` — `Packet.pb.h`, `Packet.pb.cpp`, and the UE-specific `Packet.pb.ue.h` wrapper. All gameplay packets are serialized with Protocol Buffers v3 and framed with the 4-byte `PacketHeader` (2-byte size + 2-byte packet ID) described in the [Packet Protocol](/systems/packet-protocol) reference.
+
+<Note>
+  The client proto file (`MMOClient1/Source/MMOClient1/Proto/Packet.proto`) and the server proto file (`ServerSolution/ServerSolution/Proto/Packet.proto`) must always be identical. If you change one, regenerate and update both.
+</Note>
+
+## Packets Sent by the Client
+
+These are `C_` (client-to-server) messages. Most travel over TCP; `C_MoveReq` and `C_UdpHelloReq` use the UDP channel.
+
+### C_EnterGameReq — `0x0201`
+
+Sent over TCP immediately after the TCP connection is established. The `enter_token` is the short-lived token received from the AuthServer's `/auth/select-server` response.
+
+```protobuf
+message C_EnterGameReq {
+  string enter_token = 1;
+  uint64 character_id = 2;
+}
+```
+
+<ParamField body="enter_token" type="string" required>
+  Short-lived enter token issued by the AuthServer. Valid for `EnterTokenSeconds` (default 60 seconds).
+</ParamField>
+
+<ParamField body="character_id" type="uint64" required>
+  Character ID returned by `/auth/select-server` in `SelectServerResponse.CharacterId`.
+</ParamField>
+
+---
+
+### C_UdpHelloReq — `0x0204`
+
+Sent over UDP to register the client's UDP endpoint with the server after `S_EnterGameRes` is received.
+
+```protobuf
+message C_UdpHelloReq {
+  string udp_token = 1;
+  uint64 account_id = 2;
+  uint64 character_id = 3;
+}
+```
+
+<ParamField body="udp_token" type="string" required>
+  Token returned in `S_EnterGameRes.udp_token` for binding the UDP endpoint.
+</ParamField>
+
+<ParamField body="account_id" type="uint64" required>
+  Account ID from `S_EnterGameRes.account_id`.
+</ParamField>
+
+<ParamField body="character_id" type="uint64" required>
+  Character ID from `S_EnterGameRes.character_id`.
+</ParamField>
+
+---
+
+### C_MoveReq — `0x0211`
+
+Sent over UDP at the movement input rate. The server uses `input_sequence` for client-side prediction reconciliation.
+
+```protobuf
+message C_MoveReq {
+  uint32 input_sequence = 1;
+  float move_x = 2;
+  float move_y = 3;
+  float yaw = 4;
+  uint64 client_time_ms = 5;
+}
+```
+
+<ParamField body="input_sequence" type="uint32" required>
+  Monotonically increasing sequence number. The server echoes `last_processed_input_sequence` so the client can replay unacknowledged inputs.
+</ParamField>
+
+<ParamField body="move_x" type="float" required>
+  Horizontal movement axis input, range [-1.0, 1.0].
+</ParamField>
+
+<ParamField body="move_y" type="float" required>
+  Forward/backward movement axis input, range [-1.0, 1.0].
+</ParamField>
+
+<ParamField body="yaw" type="float" required>
+  Character facing direction in degrees.
+</ParamField>
+
+<ParamField body="client_time_ms" type="uint64" required>
+  Client-side timestamp in milliseconds for latency measurement.
+</ParamField>
+
+---
+
+### C_ChatReq — `0x0221`
+
+Sends a global chat message over TCP. Maximum length is 512 characters (enforced by the server).
+
+```protobuf
+message C_ChatReq {
+  string message = 1;
+}
+```
+
+---
+
+### C_AttackReq — `0x0231`
+
+Sends a melee attack command over TCP. The server validates combo step ordering and applies server-authoritative hit detection.
+
+```protobuf
+message C_AttackReq {
+  uint32 attack_sequence = 1;
+  uint32 combo_step = 2;
+  uint64 client_time_ms = 3;
+}
+```
+
+<ParamField body="attack_sequence" type="uint32" required>
+  Monotonically increasing per-character sequence number for deduplication.
+</ParamField>
+
+<ParamField body="combo_step" type="uint32" required>
+  Current step in the combo chain (1, 2, 3, …).
+</ParamField>
+
+---
+
+### C_InventoryMoveReq — `0x0252`
+
+Requests moving an item between two inventory slots. Uses a 16-byte idempotency key so retries are safe.
+
+```protobuf
+message C_InventoryMoveReq {
+  bytes client_request_id = 1;
+  uint64 expected_revision = 2;
+  uint64 item_instance_id = 3;
+  uint32 source_slot = 4;
+  uint32 destination_slot = 5;
+  uint32 quantity = 6;
+}
+```
+
+<ParamField body="client_request_id" type="bytes" required>
+  16-byte UUID used as an idempotency key. The server returns this value in `S_InventoryOperationResult` so the client can match responses to requests.
+</ParamField>
+
+<ParamField body="expected_revision" type="uint64" required>
+  The client's current inventory revision. If the server's revision differs, the operation is rejected and the client must re-read the snapshot.
+</ParamField>
+
+---
+
+### C_InventoryUseReq — `0x0254`
+
+Requests using (consuming) an item from a specific slot.
+
+```protobuf
+message C_InventoryUseReq {
+  bytes client_request_id = 1;
+  uint64 expected_revision = 2;
+  uint64 item_instance_id = 3;
+  uint32 slot_index = 4;
+}
+```
+
+---
+
+## Packets Received by the Client
+
+These are `S_` (server-to-client) messages received over TCP, except movement batch notifications which arrive over UDP.
+
+### S_EnterGameRes — `0x0202`
+
+Response to `C_EnterGameReq`. On success, contains the UDP token and port to use for `C_UdpHelloReq`.
+
+```protobuf
+message S_EnterGameRes {
+  bool success = 1;
+  string message = 2;
+  uint64 account_id = 3;
+  uint64 character_id = 4;
+  string udp_token = 5;
+  uint32 udp_port = 6;
+}
+```
+
+### S_UdpHelloRes — `0x0205`
+
+Response to `C_UdpHelloReq`. On success, includes the current server time for clock synchronization.
+
+```protobuf
+message S_UdpHelloRes {
+  bool success = 1;
+  string message = 2;
+  uint64 server_time_ms = 3;
+}
+```
+
+### S_SpawnMyCharacter — `0x0203`
+
+Sent after `S_EnterGameRes` succeeds. Provides the character's initial world position.
+
+```protobuf
+message S_SpawnMyCharacter {
+  uint64 character_id = 1;
+  float x = 2;
+  float y = 3;
+  float z = 4;
+}
+```
+
+### S_SpawnOtherCharacter — `0x0206`
+
+Sent when another player enters this client's Area of Interest.
+
+```protobuf
+message S_SpawnOtherCharacter {
+  uint64 character_id = 1;
+  float x = 2;
+  float y = 3;
+  float z = 4;
+  float yaw = 5;
+}
+```
+
+### S_DespawnCharacter — `0x0207`
+
+Sent when another player exits this client's Area of Interest or disconnects.
+
+```protobuf
+message S_DespawnCharacter {
+  uint64 character_id = 1;
+}
+```
+
+### S_MoveNotify — `0x0212`
+
+Sent per-player over UDP when `MoveBatchNotify` is not used. Carries the server-authoritative position.
+
+```protobuf
+message S_MoveNotify {
+  uint64 character_id = 1;
+  uint32 last_processed_input_sequence = 2;
+  float x = 3;
+  float y = 4;
+  float z = 5;
+  float velocity_x = 6;
+  float velocity_y = 7;
+  float velocity_z = 8;
+  float yaw = 9;
+  uint64 server_time_ms = 10;
+}
+```
+
+### S_ChatNtf — `0x0222`
+
+Global chat broadcast received by all authenticated sessions.
+
+```protobuf
+message S_ChatNtf {
+  uint64 sender_id = 1;
+  string sender_name = 2;
+  string message = 3;
+}
+```
+
+### S_AttackAck — `0x0232`
+
+Server acknowledgement of a `C_AttackReq`.
+
+```protobuf
+message S_AttackAck {
+  bool success = 1;
+  string message = 2;
+  uint32 attack_sequence = 3;
+  uint32 combo_step = 4;
+  uint64 server_time_ms = 5;
+}
+```
+
+### S_InventorySnapshot — `0x0251`
+
+Full inventory state sent on enter-game and after any inventory operation.
+
+```protobuf
+message InventoryItem {
+  uint64 item_instance_id = 1;
+  uint32 template_id = 2;
+  uint32 quantity = 3;
+  uint32 slot_index = 4;
+  uint32 durability = 5;
+}
+
+message S_InventorySnapshot {
+  bool success = 1;
+  string message = 2;
+  uint64 revision = 3;
+  uint32 capacity = 4;
+  repeated InventoryItem items = 5;
+}
+```
+
+### S_InventoryOperationResult — `0x0253`
+
+Result of a `C_InventoryMoveReq` or `C_InventoryUseReq`. Contains an updated inventory snapshot on success.
+
+```protobuf
+message S_InventoryOperationResult {
+  bool success = 1;
+  string message = 2;
+  bytes client_request_id = 3;
+  S_InventorySnapshot snapshot = 4;
+}
+```
+
+### S_ErrorRes — `0x0003`
+
+General error response. Sent when any request cannot be processed.
+
+```protobuf
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_MALFORMED_PACKET = 1;
+  ERROR_CODE_UNKNOWN_PACKET = 2;
+  ERROR_CODE_INVALID_DATA = 3;
+  ERROR_CODE_INVALID_STATE = 4;
+  ERROR_CODE_AUTH_REQUIRED = 5;
+  ERROR_CODE_RATE_LIMITED = 6;
+}
+
+message S_ErrorRes {
+  uint32 request_packet_id = 1;
+  ErrorCode error_code = 2;
+  string message = 3;
+}
+```
+
+## Regenerating Proto Files
+
+If `Packet.proto` changes, regenerate the C++ bindings for both the server and client:
+
+```bash
+# Generate server-side files
+protoc --cpp_out=ServerSolution/ServerSolution/Generated/ \
+  ServerSolution/ServerSolution/Proto/Packet.proto
+
+# Generate client-side files
+protoc --cpp_out=MMOClient1/Source/MMOClient1/Proto/ \
+  MMOClient1/Source/MMOClient1/Proto/Packet.proto
+```
+
+<Warning>
+  The server (`ServerSolution/ServerSolution/Proto/Packet.proto`) and client (`MMOClient1/Source/MMOClient1/Proto/Packet.proto`) proto files must remain identical. Mismatched proto definitions cause silent deserialization errors that are difficult to debug.
+</Warning>
+
+<Tip>
+  After regenerating, rebuild both the C++ GameServer solution in Visual Studio and the UE5 client in the Unreal Editor to pick up the new generated headers.
+</Tip>

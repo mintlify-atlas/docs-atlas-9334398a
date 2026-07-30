@@ -1,0 +1,167 @@
+---
+title: "Load Testing with MoveLoadTester"
+sidebarTitle: "Load Testing"
+description: "Run MoveLoadTester to simulate hundreds of clients doing the full auth, enter-game, and UDP movement loop, then collect RTT percentile results."
+---
+
+**MoveLoadTester** (`ServerSolution/Tools/MoveLoadTester/`) is a .NET console application that spawns N concurrent clients, each executing the complete game connection flow: HTTP login and server selection, TCP `EnterGameReq`, UDP hello handshake, and then a continuous stream of `C_MoveReq` UDP packets. Warm-up traffic is excluded from the final statistics, and the tool writes a structured JSON result file that the [PerformanceReport tool](/ops/performance) can consume directly.
+
+## MoveLoadTester flags
+
+All options are parsed by a `switch` statement in `Program.cs`. Every flag takes a single value argument.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--auth-url` | `http://localhost:5000` | Base URL of the Auth HTTP service |
+| `--clients` | `10` | Number of concurrent simulated clients |
+| `--duration` | `60` | Measurement duration in seconds (after warm-up) |
+| `--warmup` | `0` | Warm-up period in seconds; this traffic is excluded from RTT stats |
+| `--connect-rate` | `0` | Maximum new TCP connections per second; `0` means connect all clients immediately |
+| `--move-hz` | `20` | Movement input packets per second per client |
+| `--echo-hz` | `1` | TCP echo request packets per second per client |
+| `--account-prefix` | `load` | Account name prefix; accounts are named `{prefix}{index:D5}` |
+| `--account-start` | `0` | First account index |
+| `--password` | `12345678` | Password used for all test accounts |
+| `--server-id` | `1` | Game server ID sent to `/auth/select-server` |
+| `--game-host` | _(from select-server)_ | Override the game server IP returned by the auth service |
+| `--game-port` | _(from select-server)_ | Override the game server TCP port |
+| `--output` | _(none)_ | Path for the final JSON result file |
+| `--series-output` | _(none)_ | Path for the per-second time-series CSV |
+| `--run-id` | _(auto-generated)_ | Identifier embedded in the result JSON |
+| `--scenario` | _(auto-generated)_ | Scenario label; auto-derived from `--move-hz` and `--echo-hz` if omitted |
+
+### Example invocation
+
+```bash
+dotnet run --project ServerSolution/Tools/MoveLoadTester -- \
+  --auth-url http://localhost:5000 \
+  --clients 100 \
+  --duration 60 \
+  --warmup 10 \
+  --connect-rate 20 \
+  --move-hz 20 \
+  --echo-hz 1 \
+  --output Performance/run-001.json \
+  --series-output Performance/run-001-series.csv
+```
+
+## What each client does
+
+Each simulated client runs the following sequence in order:
+
+<Steps>
+  <Step title="Register (best-effort)">
+    `POST /auth/register` with the account credentials. Errors are silently ignored — the account may already exist from a previous run.
+  </Step>
+  <Step title="Login">
+    `POST /auth/login` to obtain an `accessToken`.
+  </Step>
+  <Step title="Select server">
+    `POST /auth/select-server` with the `accessToken` and `--server-id`. The response provides `gameServerIp`, `gameServerPort`, `enterToken`, and `characterId`.
+  </Step>
+  <Step title="TCP connect">
+    Opens a TCP connection to the game server and sends `EnterGameReq` (packet ID `0x0201`) containing the `enterToken` and `characterId`. Waits for `EnterGameRes` (packet ID `0x0202`) which carries a `udpToken` and UDP port.
+  </Step>
+  <Step title="UDP hello">
+    Sends `UdpHelloReq` (packet ID `0x0204`) over UDP carrying the `udpToken`, `accountId`, and `characterId`. The server binds the UDP endpoint for this session.
+  </Step>
+  <Step title="Move loop">
+    At `--move-hz` packets per second, sends `C_MoveReq` (packet ID `0x0211`) with a rotating direction vector. The client cycles through four cardinal directions every 120 packets. Latency is measured from the send timestamp to the arrival of the corresponding `S_MoveNotify` or `S_MoveBatchNotify` that echoes back `lastProcessedInputSequence`.
+  </Step>
+  <Step title="Echo loop (TCP)">
+    Concurrently, at `--echo-hz` packets per second, sends `EchoReq` (packet ID `0x0001`) over TCP. Echo RTT is tracked separately from movement RTT.
+  </Step>
+</Steps>
+
+## LoadMetrics and final report
+
+The `LoadMetrics` class records all events via lock-free atomics and a `LatencyHistogram` with 0.25 ms buckets capped at 60 000 ms. During the warm-up phase no latency samples are recorded and the measured send/receive counters are not incremented. After the run ends, `BuildFinal` produces a `LoadTestResult` record that is written to `--output`:
+
+```json
+{
+  "runId": "load-20240101T120000Z-...",
+  "scenario": "move-20hz-echo-1hz",
+  "clients": 100,
+  "warmupSeconds": 10,
+  "durationSeconds": 60,
+  "moveHz": 20,
+  "echoHz": 1,
+  "connected": 100,
+  "entered": 100,
+  "udpHello": 100,
+  "connectFailed": 0,
+  "enterFailed": 0,
+  "clientFailures": 0,
+  "measuredMoveSent": 120000,
+  "measuredMoveReceived": 119850,
+  "moveRtt": { "samples": 119850, "averageMs": 8.5, "p50Ms": 7.75, "p95Ms": 18.0, "p99Ms": 28.5, "maxMs": 120.0 },
+  "echoRtt": { "samples": 5990, "averageMs": 0.5, "p50Ms": 0.5, "p95Ms": 0.75, "p99Ms": 1.0, "maxMs": 4.0 }
+}
+```
+
+Real-time progress is printed to the console every second in the format:
+
+```
+[Load] phase=warmup clients=100 connected=84 entered=80 udpHello=80 moveSendPps=1600.0 moveRecvPps=1590.0 moveRttP99Ms=0.00 ...
+[Load] phase=measure clients=100 connected=100 entered=100 udpHello=100 moveSendPps=2000.0 moveRecvPps=1995.0 moveRttP99Ms=22.50 ...
+```
+
+## PowerShell test scripts
+
+`ServerSolution/Tools/` includes lightweight PowerShell scripts for smoke-testing individual flows without running the full load tester.
+
+<CodeGroup>
+```powershell TestAuthFlow.ps1
+# Register, login, list servers, and select-server
+# Defaults: -BaseUrl https://localhost:5001 -Account test -Password 12345678 -Nickname Tester -ServerId 1
+.\TestAuthFlow.ps1 -BaseUrl http://localhost:5000 -Account myuser -Password mypassword
+```
+
+```powershell TestPacketEcho.ps1
+# Send a single TCP echo packet and print the round-trip
+# Defaults: -HostName 127.0.0.1 -Port 7777 -Message "hello iocp"
+.\TestPacketEcho.ps1 -HostName 127.0.0.1 -Port 7777 -Message "ping"
+```
+
+```powershell RunPacketEchoTest.ps1
+# Starts the server executable, runs TestPacketEcho.ps1, then stops the server
+# Defaults: -ServerExe E:\ServerSolution\x64\Debug\ServerSolution.exe
+.\RunPacketEchoTest.ps1 -ServerExe .\x64\Release\ServerSolution.exe
+```
+
+```powershell TestEnterGame.ps1
+# Connect TCP and send EnterGameReq with a pre-obtained enter token
+# Requires -EnterToken obtained from TestAuthFlow.ps1 select-server output
+.\TestEnterGame.ps1 -HostName 127.0.0.1 -Port 7777 -EnterToken <token> -CharacterId 1
+```
+</CodeGroup>
+
+Use `TestAuthFlow.ps1` first to obtain an `EnterToken`, then pass it to `TestEnterGame.ps1` to verify the full TCP game-entry path:
+
+```powershell
+# Step 1 – get a token (copy enterToken from the output)
+.\TestAuthFlow.ps1 -BaseUrl http://localhost:5000
+
+# Step 2 – enter the game with that token
+.\TestEnterGame.ps1 -EnterToken "abc123..." -CharacterId 1
+```
+
+## Load-test spawn spread
+
+When running many clients on a single server instance, all spawned characters would land on the same map position by default, placing every player in every other player's Area of Interest and generating worst-case fanout. The flag `EnableLoadTestSpawnSpread` avoids this:
+
+```cpp
+constexpr bool  EnableLoadTestSpawnSpread = true;
+constexpr float LoadTestSpawnSpacing      = MovementAoiViewDistance + 1000.0f; // 4000 UU
+constexpr int   LoadTestSpawnGridWidth    = 10;
+```
+
+With these defaults, players are placed on a 10 × 10 grid with 4000 Unreal Units between each grid cell. Because `MovementAoiViewDistance` is 3000 UU, adjacent cells are just outside each other's AoI, preventing cross-client movement notifications and giving a cleaner measurement of per-client throughput rather than AoI fanout overhead.
+
+<Tip>
+  Always run load tests against a **Release** build. The Debug build carries bounds-checking and assertion overhead that can make tick-time measurements several times higher than they would be in production, leading to misleading baseline values.
+</Tip>
+
+<Warning>
+  MoveLoadTester calls `POST /auth/register` for every client index at startup. All test accounts (`load00000`, `load00001`, …) are persisted to the database. Clean them up after testing — either by truncating the accounts table or by using a dedicated test database instance that is discarded after each run.
+</Warning>

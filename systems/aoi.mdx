@@ -1,0 +1,131 @@
+---
+title: "Area of Interest: Cell Grid for Visibility Culling"
+sidebarTitle: "AoI System"
+description: "How the server uses a spatial cell grid to limit movement, spawn, and monster notifications to nearby players only, including player visibility tracking and monster observer maps."
+---
+
+Without an Area of Interest (AoI) system, every player position update would need to be broadcast to every connected session—an O(n²) problem that collapses server throughput as player count grows. The AoI system divides the world into a grid of square cells and maintains per-cell session lists so that movement notifications, spawn events, and monster broadcasts are sent only to players whose cells overlap with the source entity's neighbourhood. A nine-cell neighbourhood search (3×3 grid centred on the source) is sufficient because each cell is exactly one `MovementAoiViewDistance` wide.
+
+## Cell Grid
+
+The world is partitioned using two Config.h constants:
+
+```cpp
+constexpr float MovementAoiViewDistance = 3000.0f;  // Unreal Units
+constexpr float MovementAoiCellSize     = MovementAoiViewDistance;  // 3000 UU per cell
+```
+
+A world position `(x, y)` maps to a cell coordinate:
+
+```cpp
+static AoiCell IOCPServer::GetAoiCell(float x, float y)
+{
+    return AoiCell{
+        static_cast<int32>(std::floor(x / Config::MovementAoiCellSize)),
+        static_cast<int32>(std::floor(y / Config::MovementAoiCellSize))
+    };
+}
+```
+
+Cells are stored in a flat `unordered_map` keyed by a 64-bit integer formed by packing the two 32-bit cell coordinates:
+
+```cpp
+static int64 IOCPServer::MakeAoiCellKey(AoiCell cell)
+{
+    return (static_cast<int64>(cell.x) << 32) | static_cast<uint32>(cell.y);
+}
+
+// Storage
+std::unordered_map<int64, std::unordered_map<uint64, Session*>> aoiCells_;
+std::unordered_map<uint64, AoiSessionEntry> aoiSessions_;
+```
+
+Both maps are protected by `aoiMutex_` (a `std::shared_mutex`); readers (peer lookups) take a shared lock and writers (session registration, position updates, removal) take an exclusive lock.
+
+## Player AoI
+
+<Steps>
+  <Step title="Register">
+    When a player successfully enters the game and a `PlayerEntity` is attached, `RegisterAoiSession(session)` inserts the session into `aoiCells_` at its initial spawn cell and records the `AoiSessionEntry` in `aoiSessions_`.
+  </Step>
+  <Step title="Update on movement">
+    During the **PlayerMovement** tick phase, after `StepMovement()` returns a new `MovementSnapshot`, `UpdateAoiSession(session, snapshot)` is called. If the session's cell has changed, it is removed from the old cell bucket and inserted into the new one. `aoiSessions_` is updated to reflect the new cell.
+  </Step>
+  <Step title="Peer lookup">
+    `FindPlayerAoiPeers(snapshot)` and `CollectPlayerAoiPeers(...)` search the 3×3 neighbourhood of cells centred on the mover's cell (up to 9 cells) and collect all `Session*` entries whose characters are within `IsInMovementAoi()` range.
+  </Step>
+  <Step title="Remove">
+    `RemoveAoiSession(sessionId)` is called during session teardown, removing the entry from both maps and releasing any visibility pairs.
+  </Step>
+</Steps>
+
+## Visibility Tracking
+
+Beyond cell membership, the server tracks which pairs of players are actually visible to each other using a slot-based bitset. Each `Session` has a fixed `poolSlot_` index (0–1023 for a 1,024-session pool). The visibility state is stored in two parallel vectors indexed by slot:
+
+```cpp
+std::vector<uint64>              playerVisibilitySessionIdsBySlot_;
+std::vector<std::vector<uint64>> playerVisibilityBitsBySlot_;
+std::vector<uint64>              playerVisibilityScratch_;
+```
+
+Each entry in `playerVisibilityBitsBySlot_[slotA]` is a bitmask where bit `slotB` is set when player A can currently see player B. This allows O(1) visibility checks and efficient diff computation during `UpdatePlayerVisibility`.
+
+```cpp
+bool AddPlayerVisibilityPair(Session* firstSession, Session* secondSession);
+
+bool UpdatePlayerVisibility(
+    Session* movedSession,
+    const std::vector<Session*>& peers,      // current AoI peers after movement
+    std::vector<uint64>& enteredPeerIds,     // newly visible peer IDs (→ SpawnOtherCharacter)
+    std::vector<uint64>& exitedPeerIds);     // no-longer-visible peer IDs (→ DespawnCharacter)
+
+std::vector<uint64> RemovePlayerVisibilitySession(Session* session);
+```
+
+When `UpdatePlayerVisibility` detects that `enteredPeerIds` is non-empty, the server sends `S_SpawnOtherCharacter` to the moving player and also to each entering peer. When `exitedPeerIds` is non-empty, `S_DespawnCharacter` is sent in both directions.
+
+## Enter and Exit Events
+
+<CardGroup cols={2}>
+  <Card title="Enter AoI → SpawnOtherCharacter" icon="user-plus">
+    When player A moves into player B's cell neighbourhood and the visibility bitset transition from invisible to visible, the server sends `S_SpawnOtherCharacter` (0x0206) to B describing A's current position and yaw, and vice-versa.
+  </Card>
+  <Card title="Exit AoI → DespawnCharacter" icon="user-minus">
+    When the movers no longer share any of the 9 neighbourhood cells, the visibility bit is cleared and `S_DespawnCharacter` (0x0207) is sent to both sessions so each client can remove the entity from its local world.
+  </Card>
+</CardGroup>
+
+## Monster AoI
+
+Monsters use the same cell grid but have a separate observer tracking map and a configurable refresh interval:
+
+```cpp
+constexpr float MonsterAoiViewDistance            = MovementAoiViewDistance;  // 3000 UU
+constexpr float MonsterAoiRefreshIntervalSeconds  = 0.2f;   // refresh every 200 ms
+```
+
+```cpp
+std::unordered_map<Game::EntityId, std::unordered_set<uint64>> monsterObservers_;
+```
+
+During the **MonsterNotifications** tick phase, `monsterSnapshotAccumulator_` is incremented by `deltaSeconds`. When it exceeds `MonsterAoiRefreshIntervalSeconds`, `RefreshMonsterAoi()` iterates all live monsters, calls `FindMonsterAoiWatchers()` (same 9-cell search using the monster's position), and updates `monsterObservers_`. Sessions that newly entered a monster's AoI receive `S_SpawnMonster`; sessions that exited receive `S_DespawnMonster`. Active observers receive `S_MonsterMoveNotify`.
+
+`FindMonsterAoiWatchers` is analogous to `FindPlayerAoiPeers` but receives a `MonsterEntity` instead of a `MovementSnapshot`:
+
+```cpp
+bool IOCPServer::IsMonsterInAoi(
+    const Game::MonsterEntity& monster,
+    const Session::MovementSnapshot& watcher) const;
+
+std::vector<Session*> IOCPServer::FindMonsterAoiWatchers(
+    const Game::MonsterEntity& monster);
+```
+
+<Note>
+When a monster is killed, `HandleMonsterDeath()` calls `DespawnMonsterFromObservers()` to send `S_DespawnMonster` to all current observers, then calls `ScheduleMonsterRespawn()` which posts a `TimerManager` callback delayed by `MonsterRespawnDelaySeconds = 30` seconds. After 30 seconds `SpawnMonsterAtSpawnPoint()` re-creates the monster entity and begins broadcasting `S_SpawnMonster` to AoI watchers again.
+</Note>
+
+<Tip>
+Tuning `MovementAoiViewDistance` in `Config.h` directly controls bandwidth consumption. Halving the view distance from 3,000 UU to 1,500 UU reduces the neighbourhood area by 75 %, which can dramatically cut movement replication and spawn-notification traffic in dense scenarios. Because `MovementAoiCellSize = MovementAoiViewDistance`, the cell size changes automatically. Rebuild and re-deploy after any Config.h change—no runtime config reload is supported.
+</Tip>

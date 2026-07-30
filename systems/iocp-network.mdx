@@ -1,0 +1,112 @@
+---
+title: "IOCP Async Networking in the C++ Game Server"
+sidebarTitle: "IOCP Network"
+description: "How the C++ MMO server uses Windows IOCP with AcceptEx, worker threads, TCP sessions, and a UDP socket on the same port for low-latency movement replication."
+---
+
+The server's network layer is built directly on Windows I/O Completion Ports (IOCP), the highest-throughput async I/O model available on Win32. Rather than one thread per connection, IOCP posts completed I/O events—accepts, receives, sends, disconnects, and timer firings—onto a shared kernel queue. A fixed pool of `WORKER_THREAD_COUNT = 4` worker threads calls `GetQueuedCompletionStatus` in a tight loop, pulling completions off that queue and dispatching them by their `IoType`. This design scales to thousands of concurrent TCP sessions without thread explosion and keeps latency predictable under load.
+
+## IoType Enum
+
+Every asynchronous I/O operation the server posts is represented by an `IoContext` structure. The `IoType` field on that context tells the worker thread what kind of completion arrived.
+
+```cpp
+enum class IoType
+{
+    Accept,     // AcceptEx completed – a new TCP connection is ready
+    Recv,       // WSARecv completed – data arrived on a TCP session
+    Send,       // WSASend completed – a send buffer was flushed
+    Disconnect, // DisconnectEx completed – socket can be reused
+    UdpRecv,    // WSARecvFrom completed – UDP datagram arrived
+    UdpSend,    // WSASendTo completed – UDP datagram was sent
+    Timer       // Timer callback posted via IOCP – no I/O involved
+};
+```
+
+| `IoType`     | Meaning                                                                                         |
+|--------------|-------------------------------------------------------------------------------------------------|
+| `Accept`     | `AcceptEx` fired; `HandleAcceptCompletion` extracts the remote address and registers the session |
+| `Recv`       | TCP bytes arrived; `ProcessRecvData` assembles packets from the ring buffer and dispatches them  |
+| `Send`       | Outbound TCP data was consumed; `TryPostNextSend` chains the next queued send if one exists      |
+| `Disconnect` | `DisconnectEx` with `TF_REUSE_SOCKET` completed; socket is clean and session returns to pool     |
+| `UdpRecv`    | UDP datagram arrived; `HandleUdpRecvCompletion` routes it to `HandleUdpPacket`                  |
+| `UdpSend`    | UDP datagram was sent; the `IoContext` is returned to the UDP send-context pool                 |
+| `Timer`      | `TimerManager` posts a zero-byte completion to wake a worker for a scheduled callback           |
+
+## TCP Transport
+
+TCP carries all reliable packets—game entry, chat, combat acknowledgements, and inventory operations.
+
+**Accept flow:**
+
+1. `IOCPServer::Run()` calls `CreateIoCompletionPort` to create the IOCP handle, then associates the listen socket with it.
+2. `PrePostAccepts` pre-posts `InitialSessionPoolSize = 1024` `AcceptEx` calls, each backed by a pre-allocated `Session` from `SessionPool`.
+3. When a connection arrives, the completion appears with `IoType::Accept`. `HandleAcceptCompletion` calls `GetAcceptExSockAddrs` to extract the remote address, transitions the session to `Connected`, and immediately posts a fresh `AcceptEx` to keep the accept pipeline full.
+
+**Buffer sizing (from Config.h):**
+
+| Parameter               | Value       | Purpose                                                  |
+|-------------------------|-------------|----------------------------------------------------------|
+| `RecvBufferSize`        | 131,072 B   | Per-session `PacketBuffer` ring capacity                 |
+| `SendBufferSize`        | 65,536 B    | Per-session outbound scatter-gather send queue capacity  |
+| `InitialSessionPoolSize`| 1,024       | Pre-allocated `Session` objects at startup               |
+| `WORKER_THREAD_COUNT`   | 4           | Threads calling `GetQueuedCompletionStatus`              |
+| `MaxPacketSize`         | 16,384 B    | Maximum accepted incoming packet size                    |
+
+## UDP Transport
+
+A separate UDP socket is bound to the same port **7777** as the TCP listen socket. It is used exclusively for movement replication because movement inputs arrive at high frequency (up to one per client render frame) and can tolerate occasional loss.
+
+```cpp
+SOCKET udpSocket_ = INVALID_SOCKET;  // bound to port 7777, associated with the same IOCP
+```
+
+`PrePostUdpReceives` posts multiple `WSARecvFrom` calls at startup, each with `IoType::UdpRecv`. On completion, `HandleUdpRecvCompletion` identifies the session by UDP endpoint key (address + port) and routes movement inputs into the game simulation command queue. Outbound UDP datagrams use a pool of `IoContext` objects acquired via `AcquireUdpSendContext` and released in the `UdpSend` completion path.
+
+## Worker Thread Loop
+
+All four worker threads run identical loops. Pseudocode drawn from `IOCPServer::WorkerThread()`:
+
+```cpp
+void IOCPServer::WorkerThread()
+{
+    while (running_)
+    {
+        DWORD      transferred = 0;
+        ULONG_PTR  completionKey = 0;
+        IoContext* ctx = nullptr;
+
+        BOOL ok = GetQueuedCompletionStatus(
+            iocp_, &transferred, &completionKey,
+            reinterpret_cast<OVERLAPPED**>(&ctx), INFINITE);
+
+        if (!ok && ctx == nullptr)
+            break;  // shutdown sentinel
+
+        switch (ctx->type)
+        {
+        case IoType::Accept:      HandleAcceptCompletion(ctx);                    break;
+        case IoType::Recv:        /* ProcessRecvData → DispatchPacket */           break;
+        case IoType::Send:        /* session->ProcessSend → TryPostNextSend */     break;
+        case IoType::Disconnect:  /* CompleteDisconnect → PrepareForReuse */       break;
+        case IoType::UdpRecv:     HandleUdpRecvCompletion(ctx, transferred);       break;
+        case IoType::UdpSend:     ReleaseUdpSendContext(ctx);                      break;
+        case IoType::Timer:       ctx->timerCallback();                            break;
+        }
+    }
+}
+```
+
+<Note>
+`IoContext` structs are never heap-allocated per operation. Each `Session` owns three persistent contexts—`recvContext_`, `sendContext_`, and `disconnectContext_`—that are reused across the lifetime of the connection. UDP send contexts come from a separate `IoContext` pool managed by `AcquireUdpSendContext` / `ReleaseUdpSendContext`. This eliminates per-I/O allocation pressure on hot paths.
+</Note>
+
+## Port Layout
+
+```
+TCP  :7777   Reliable packets (game entry, chat, combat, inventory)
+UDP  :7777   Movement replication (C_MoveReq in, MoveBatchNotify out)
+HTTP :9108   Prometheus metrics endpoint (EnablePrometheusEndpoint = true)
+```
+
+The same port number for TCP and UDP is intentional. UDP is a connectionless datagram socket registered independently with IOCP; the OS delivers TCP and UDP completions to the same IOCP handle but the `IoType` field always distinguishes them.

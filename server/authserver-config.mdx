@@ -1,0 +1,131 @@
+---
+title: "Configure the ASP.NET Core AuthServer"
+sidebarTitle: "AuthServer Config"
+description: "Reference for every appsettings.json section, token lifecycle, and input validation rules for the ASP.NET Core AuthServer."
+---
+
+The AuthServer is an ASP.NET Core Minimal API application responsible for account registration, login, and issuing short-lived enter tokens that the C++ GameServer validates before admitting a player. All runtime configuration is read from `appsettings.json` (or environment-variable overrides following the standard ASP.NET Core configuration hierarchy), so no recompilation is needed to change database endpoints, token expiry times, or login policies.
+
+## Full appsettings.json reference
+
+The file below shows every supported section with its default or recommended values filled in.
+
+```json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "Database": {
+    "ConnectionString": "Server=127.0.0.1;Port=3306;Database=game;User=game;Password=s3cur3_g@me_pass;"
+  },
+  "Redis": {
+    "Configuration": "127.0.0.1:6379"
+  },
+  "Tokens": {
+    "AccessTokenMinutes": 60,
+    "EnterTokenSeconds": 60,
+    "DuplicateLoginPolicy": "InvalidatePrevious"
+  },
+  "AllowedHosts": "*"
+}
+```
+
+### Database section
+
+| Field | Type | Description |
+|---|---|---|
+| `ConnectionString` | string | A standard MySqlConnector connection string pointing to the MariaDB/MySQL instance that holds the `game` schema. Minimum required components: `Server`, `Port`, `Database`, `User`, `Password`. |
+
+Example connection string formats:
+
+```
+Server=127.0.0.1;Port=3306;Database=game;User=game;Password=yourpassword;
+Server=db.internal;Database=game;User=game;Password=yourpassword;SslMode=Required;
+```
+
+### Redis section
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `Configuration` | string | `127.0.0.1:6379` | StackExchange.Redis connection string. Append `,password=yourpassword` to authenticate, or use a full Redis URL. Multiple endpoints can be comma-separated for cluster/sentinel setups. |
+
+### Tokens section
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `AccessTokenMinutes` | integer | `60` | Lifetime of an access token in minutes. The token is stored in Redis with this TTL and expires automatically. Clients must re-login after expiry. |
+| `EnterTokenSeconds` | integer | `60` | Lifetime of a one-time enter token in seconds. The token is issued when a player selects a game server and must be presented to the GameServer before it expires. |
+| `DuplicateLoginPolicy` | string | `"InvalidatePrevious"` | Controls behavior when a second login request arrives for an account that already has an active session. See the [Token lifecycle](#token-lifecycle) section below. |
+
+### Logging section
+
+Standard ASP.NET Core log-level configuration. `Microsoft.AspNetCore` is set to `Warning` by default to suppress noisy request-routing messages in production.
+
+| Level | Meaning |
+|---|---|
+| `Trace` | Verbose — include all internal framework events |
+| `Debug` | Diagnostic detail useful during development |
+| `Information` | Normal operational events (startup, request summaries) |
+| `Warning` | Unexpected but recoverable situations |
+| `Error` | Failures that need attention |
+| `Critical` | Fatal errors causing process termination |
+
+## Token lifecycle
+
+The AuthServer uses Redis exclusively for token storage. No JWT signing keys are required.
+
+```
+  Client          AuthServer               Redis
+    |                  |                     |
+    |--- POST /auth/login ----------------->|
+    |                  |-- SET auth:access:<token>  (TTL = AccessTokenMinutes) -->|
+    |                  |-- SET account:session:<id> (TTL = AccessTokenMinutes) -->|
+    |<-- { accessToken } ---------------------
+    |                  |                     |
+    |--- POST /auth/select-server ---------->|
+    |                  |-- GET auth:access:<token> --------------------------->|
+    |                  |-- SET game:enter:<enterToken>  (TTL = EnterTokenSeconds, NX) -->|
+    |<-- { ip, port, enterToken, characterId }
+```
+
+**AccessToken** — A 32-byte cryptographically random hex string stored in Redis under `auth:access:<token>` with a value of `<accountId>|<nickname>`. A parallel key `account:session:<accountId>` holds the current token and allows duplicate-login detection.
+
+**EnterToken** — A second 32-byte random hex string stored under `game:enter:<enterToken>` with value `<accountId>|<serverId>|<characterId>|<nickname>`. It is written with `NX` (set-if-not-exists) to prevent replay and expires after `EnterTokenSeconds`. The C++ GameServer reads and deletes this key when a client connects.
+
+**DuplicateLoginPolicy** controls what happens when a second `/auth/login` arrives while a session key already exists in Redis:
+
+| Policy | Behavior |
+|---|---|
+| `InvalidatePrevious` | The existing access token is deleted from Redis before issuing the new one. The first client's token becomes invalid immediately. |
+| `RejectNew` | The new login request is rejected with HTTP 409 Conflict and the message `"already logged in"`. The existing session remains active. |
+
+## Input validation rules
+
+The following constraints are enforced in `Program.cs` before any database call is made. Requests that fail validation receive HTTP 400 Bad Request.
+
+| Field | Min length | Max length | Notes |
+|---|---|---|---|
+| `account` | 4 characters | 64 characters | Must not be null or whitespace |
+| `password` | 8 characters | 128 characters | Must not be null or whitespace |
+| `nickname` | 2 characters | 32 characters | Optional at registration; defaults to the account name if omitted. Values longer than 32 characters are truncated automatically. |
+
+Passwords are hashed with **PBKDF2-SHA256** (210,000 iterations) via the `Pbkdf2PasswordHasher` service before being stored in the database.
+
+## Running and publishing
+
+<Note>
+Use `dotnet run` during development — the runtime automatically picks up changes to `appsettings.json` and `appsettings.Development.json`. For production deployments, publish a self-contained binary with `dotnet publish -c Release` and place a production `appsettings.json` (or set environment variables such as `Database__ConnectionString`) alongside the executable. Never embed production credentials in the repository.
+</Note>
+
+```bash
+# Development
+cd ServerSolution/AuthServer
+dotnet run
+
+# Production build
+dotnet publish -c Release -o ./publish
+./publish/AuthServer
+```
